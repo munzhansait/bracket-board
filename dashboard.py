@@ -28,6 +28,34 @@ WINDOW_KEYS = ("7 days", "14 days", "30 days", "90 days")
 
 # ----------------------------- analytics ------------------------------
 
+def _wash_pairs(rows):
+    """Indices of events that cancel each other out and are not trades.
+
+    Moving stake within a subnet is written to the feed as a buy and a sell of
+    the identical alpha, at the identical price, in the identical second.
+    Nothing is bought and nothing is sold. Priced naively, the sell leg is
+    matched against the older, cheaper cost basis and books a profit that never
+    happened - one 8 TAO wallet was credited with 0.090 TAO of "banked" gains
+    and a 100% success rate off a single such pair.
+
+    Matching on second, subnet, alpha and price together: alpha carries nine
+    decimal places, so a genuine buy and sell colliding on all four in the same
+    second is not a coincidence that occurs.
+    """
+    groups = {}
+    for i, (ts, netuid, action, tao, alpha, price, _x) in enumerate(rows):
+        if not alpha:
+            continue
+        key = (ts, netuid, round(alpha, 9), round(price or 0.0, 9))
+        groups.setdefault(key, {"BUY": [], "SELL": []}).setdefault(action, []).append(i)
+    out = set()
+    for legs in groups.values():
+        for i, j in zip(legs.get("BUY", []), legs.get("SELL", [])):
+            out.add(i)
+            out.add(j)
+    return out
+
+
 def realized_trades(conn, coldkey, since_iso=None, limit=None):
     """Trade-by-trade realised profit, using average cost per subnet.
 
@@ -50,10 +78,13 @@ def realized_trades(conn, coldkey, since_iso=None, limit=None):
         "SELECT timestamp, netuid, action, tao_amount, alpha_amount, price, "
         "COALESCE(is_transfer,0) FROM events WHERE coldkey=? "
         "ORDER BY timestamp", (coldkey,)).fetchall()
+    wash = _wash_pairs(rows)
 
     book = {}          # netuid -> [alpha_held, tao_cost]
     shown = []
-    for ts, netuid, action, tao, alpha, price, transfer in rows:
+    for idx, (ts, netuid, action, tao, alpha, price, transfer) in enumerate(rows):
+        if idx in wash:
+            continue         # both legs skipped: no inventory change, no profit
         held, cost = book.get(netuid, [0.0, 0.0])
         pnl = pct = avg_used = None
         if action == "BUY" and alpha:
@@ -370,16 +401,19 @@ function detail(ck, row, page){
       <h3>Where the ${pct(row.r)} comes from</h3>
       <table class="bridge">
         <tr><td>Held on ${row.sd}</td><td class="num">${fmt(row.start,3)} TAO</td></tr>
-        <tr><td>Spent buying alpha</td><td class="num">${money(row.bought)}</td></tr>
-        <tr><td>Received from selling</td><td class="num">${money(-row.sold)}</td></tr>
+        <tr><td>Added by buying alpha</td><td class="num">${money(row.bought)}</td></tr>
+        <tr><td>Taken out by selling alpha</td><td class="num">${money(-row.sold)}</td></tr>
         ${row.moved?`<tr><td>Moved in from other wallets</td><td class="num">${money(row.moved)}</td></tr>`:''}
-        <tr class="gain"><td><b>Gain in value</b></td>
+        <tr class="gain"><td><b>${row.gain>=0?'Grew in price by':'Fell in price by'}</b></td>
             <td class="num ${row.gain>=0?'up':'down'}"><b>${money(row.gain)} TAO</b></td></tr>
         <tr><td>Held on ${row.ed}</td><td class="num">${fmt(row.end,3)} TAO</td></tr>
       </table>
-      <p class="sub">Start, plus what went in, minus what came out, gives the end
-      balance. Anything left over is the gain - <b>${money(row.gain)} TAO</b>, which is
-      <b>${pct(row.r)}</b> of the money at work. That is subtraction, not a model.</p>
+      <p class="sub">Read it downwards: it started with ${fmt(row.start,3)} TAO of alpha,
+      buying added ${fmt(row.bought,3)} and selling took out ${fmt(row.sold,3)}
+      ${Math.abs(row.bought-row.sold)<0.001?'(so trading left it square)':''}, and it ended
+      on ${fmt(row.end,3)}. The <b>${money(row.gain)} TAO</b> that the other lines cannot
+      account for is what the alpha itself did &mdash; that is
+      <b>${pct(row.r)}</b> of the money at work. Subtraction, not a model.</p>
       <div class="kpi" style="margin-top:12px">
         <div><b class="${row.realised>=0?'up':'down'}">${money(row.realised)}</b>
              <small>banked on sales</small></div>
