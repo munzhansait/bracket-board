@@ -67,28 +67,44 @@ def backfill_events(conn, ck):
 
 def backfill_history(conn, ck):
     """Daily per-subnet balances -> aggregate to wallet_daily (only for
-    days older than existing snapshots, so live delta data wins)."""
+    days older than existing snapshots, so live delta data wins).
+
+    The history endpoint requires coldkey AND hotkey AND netuid together -
+    passing coldkey alone returns HTTP 400 - so walk every position this
+    wallet is known to hold, taken from the holders table.
+    """
+    positions = conn.execute(
+        "SELECT DISTINCT hotkey, netuid FROM holders WHERE coldkey=?",
+        (ck,)).fetchall()
+    if not positions:
+        return True  # nothing known to fetch; don't retry this wallet forever
     daily = {}
-    page = 1
-    while page <= MAX_HISTORY_PAGES:
-        data = sweep.api_get(conn, "/api/dtao/stake_balance/history/v1?coldkey={}&limit={}&page={}"
-                             .format(ck, PAGE_LIMIT, page))
-        if data is None:
-            return False
-        items = data.get("data", [])
-        if page == 1 and items:
-            print("  history sample keys: {}".format(sorted(items[0].keys())))
-        for item in items:
-            day = str(item.get("timestamp", ""))[:10]
-            if not day:
-                continue
-            tao = sweep.rao_to_tao(item.get("balance_as_tao"))
-            netuid = item.get("netuid", -1)
-            daily.setdefault(day, {})[netuid] = daily.get(day, {}).get(netuid, 0.0) + tao
-        nxt = (data.get("pagination") or {}).get("next_page")
-        if not nxt:
-            break
-        page = nxt
+    sampled = False
+    for hotkey, netuid in positions:
+        page = 1
+        while page <= MAX_HISTORY_PAGES:
+            data = sweep.api_get(
+                conn,
+                "/api/dtao/stake_balance/history/v1?coldkey={}&hotkey={}"
+                "&netuid={}&limit={}&page={}".format(
+                    ck, hotkey, netuid, PAGE_LIMIT, page))
+            if data is None:
+                return False
+            items = data.get("data", [])
+            if not sampled and items:
+                print("  history sample keys: {}".format(sorted(items[0].keys())))
+                sampled = True
+            for item in items:
+                day = str(item.get("timestamp", ""))[:10]
+                if not day:
+                    continue
+                tao = sweep.rao_to_tao(item.get("balance_as_tao"))
+                daily.setdefault(day, {})
+                daily[day][netuid] = daily[day].get(netuid, 0.0) + tao
+            nxt = (data.get("pagination") or {}).get("next_page")
+            if not nxt:
+                break
+            page = nxt
     first_live = conn.execute(
         "SELECT MIN(day) FROM wallet_daily WHERE coldkey=?", (ck,)).fetchone()[0]
     for day, per_subnet in daily.items():
