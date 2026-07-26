@@ -424,7 +424,15 @@ function detail(ck, row, page){
       <p class="sub">The gain splits in two: <b>${money(row.realised)} TAO</b> actually
       banked by selling - every one of those sales is listed below and they add up to
       exactly that - and <b>${money(unreal)} TAO</b> that is only a paper gain on alpha
-      still held. Prices move, so the paper part can vanish.</p>
+      still held.</p>
+      ${row.gain>0&&unreal/row.gain>0.9?`<p class="sub"
+        style="border-left:3px solid var(--warn);padding-left:10px">
+        <b>Read this one carefully.</b> ${Math.round(100*unreal/row.gain)}% of this
+        gain has not been sold. It is alpha valued at what the subnet last traded at,
+        which is not the same as money in hand: prices move, and subnet pools are
+        small enough that selling a large holding pushes the price down as you sell.
+        A wallet that has never sold has not yet proved it can get out at these
+        prices.</p>`:''}
     </div></div>
     <h3>Every trade in these ${win}</h3>${tradeRows(w.tr, ck, page||0)}</div>`;
 }
@@ -452,20 +460,40 @@ function board(){
     const rows=b.b[label]; total+=rows.length;
     h+=`<h3>Wallets holding ${label} TAO</h3>`;
     if(!rows.length){h+='<div class="empty">No wallet in this size range passed every check.</div>';continue;}
-    h+=`<div class="scroll"><table><tr><th>#</th><th>Wallet</th><th class="num">Return</th>
-      <th class="num">Gain (TAO)</th><th class="num">Banked</th>
+    h+=`<div class="scroll"><table><tr><th>#</th><th>Wallet</th>
+      <th class="num">Total return</th><th class="num">Gain (TAO)</th>
+      <th class="num">Actually banked</th><th class="num">Still on paper</th>
       <th class="num">Holds now</th><th class="num">Trades</th></tr>`;
     rows.forEach((r,i)=>{
+      const paper=r.gain-r.realised;
+      const share=r.gain>0?paper/r.gain:0;
+      const warn=share>0.9?' <span class="flag" title="Almost all of this gain is unsold alpha valued at the market price - it is not money until it is sold, and selling a large holding can move the price against you">mostly on paper</span>':'';
       h+=`<tr class="w" data-ck="${r.ck}" data-i="${i}" data-label="${label}">
         <td><span class="rank ${i===0?'top':''}">${i+1}</span></td>
         <td class="mono">${short(r.ck)}</td>
-        <td class="num ${r.r>=0?'up':'down'}">${pct(r.r)}</td>
+        <td class="num ${r.r>=0?'up':'down'}">${pct(r.r)}${warn}</td>
         <td class="num">${fmt(r.gain,2)}</td>
         <td class="num ${r.realised>=0?'up':'down'}">${fmt(r.realised,2)}</td>
+        <td class="num">${fmt(paper,2)}</td>
         <td class="num">${fmt(r.v,2)}</td><td class="num">${r.t}</td></tr>
-        <tr class="d" data-for="${r.ck}" style="display:none"><td colspan="7"></td></tr>`;
+        <tr class="d" data-for="${r.ck}" style="display:none"><td colspan="8"></td></tr>`;
     });
     h+='</table></div>';
+  }
+  // If nearly every row shares the paper-gain condition it is a property of
+  // the board, not a distinguishing mark, and saying so once is more use than
+  // tagging every line identically.
+  const all=[]; for(const k in b.b) all.push(...b.b[k]);
+  const onPaper=all.filter(r=>r.gain>0&&(r.gain-r.realised)/r.gain>0.9).length;
+  if(all.length && onPaper/all.length>0.8){
+    h=`<div class="explain" style="border-left-color:var(--warn)">
+      <b>Read the whole board this way.</b> ${onPaper} of these ${all.length} wallets
+      have banked almost nothing - over 90% of every gain shown is alpha that has gone
+      up in price but has not been sold. These are holders whose subnet rose, not
+      traders who have taken money off the table, and none of them has yet shown it can
+      sell a sizeable holding without pushing the price down. Treat the ranking as
+      "who is holding the right thing", not "who has made money".
+      </div>` + h;
   }
   const x=b.x||{}, keys=Object.keys(x).sort((a,c)=>x[c]-x[a]);
   if(keys.length){
@@ -582,10 +610,15 @@ best this week; "90 days" rewards consistency over luck.</div>
 <div class="step"><span>3</span><b>Click any row</b> to see that wallet's chart and
 every trade it made - what it bought, when it sold, and what it earned or lost.</div>
 </div>
-<p class="sub" style="margin-top:12px"><b>Return</b> is the gain on the money actually
-invested, so someone who simply deposited more does not appear to be winning. It is a
-different measure from the <b>profit on each sale</b> shown inside a wallet: the first
-tracks what the holdings are worth, the second what was banked when something was sold.
+<p class="sub" style="margin-top:12px"><b>Total return</b> is the gain on the money
+actually invested, so someone who simply deposited more does not appear to be winning.
+It counts alpha that has gone up but has not been sold - the same convention a fund
+uses when it reports a yearly figure, and the honest one, since ignoring it would
+flatter whoever sells fastest rather than whoever picks best. The table splits it
+anyway: <b>actually banked</b> is money from completed sales, <b>still on paper</b> is
+alpha marked at the last traded price. Paper gains are not money until sold, and subnet
+pools are small enough that a big sale moves the price against the seller - so a row
+flagged <span class="flag">mostly on paper</span> has not yet proved it can get out.
 Wallets that never bought alpha - miners, validators, subnet owners - are left out,
 because their balance grows from running a subnet, not from picking one.</p>
 </div>
