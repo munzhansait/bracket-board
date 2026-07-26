@@ -72,6 +72,10 @@ def db():
     conn.execute("""CREATE TABLE IF NOT EXISTS wallet_daily(
         day TEXT, coldkey TEXT, total_tao REAL, subnets INTEGER,
         PRIMARY KEY (day, coldkey))""")
+    # The holders primary key leads with netuid, so looking a wallet's subnets
+    # up by coldkey cannot use it. The leaderboard does exactly that for every
+    # event row when restricting flows to tracked subnets.
+    conn.execute("CREATE INDEX IF NOT EXISTS h_cold ON holders(coldkey, netuid)")
     return conn
 
 

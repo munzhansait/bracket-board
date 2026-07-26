@@ -279,17 +279,32 @@ function tradeRows(tr){
   return h+'</table></div>';
 }
 
+/* Clip the history to the window being ranked, so the chart is the evidence
+   for the number above it rather than a different period entirely. */
+function windowSeries(series){
+  const days=parseInt(win,10); if(!days||!series.length) return series;
+  const end=new Date(series[series.length-1][0]+'T00:00:00Z');
+  const cut=new Date(end.getTime()-days*86400000).toISOString().slice(0,10);
+  const clipped=series.filter(p=>p[0]>=cut);
+  return clipped.length>1?clipped:series;
+}
+
 function detail(ck){
   const w=D.wallets[ck]; if(!w) return '';
   const wins=w.tr.filter(t=>t.pnl!==null&&t.pnl>0).length;
   const losses=w.tr.filter(t=>t.pnl!==null&&t.pnl<0).length;
   const net=w.tr.reduce((a,t)=>a+(t.pnl||0),0);
   const rate=(wins+losses)?Math.round(100*wins/(wins+losses)):null;
+  const ser=windowSeries(w.s);
   return `<div class="detail"><div class="grid2">
     <div>
-      <h3>Portfolio value (TAO)</h3>
-      <div class="chartbox" data-ck="${ck}">${chart(w.s,560,190)}</div>
-      <div class="legend"><span><i class="swatch"></i>Total held, all subnets</span></div>
+      <h3>What it held over the last ${win}</h3>
+      <div class="chartbox" data-ck="${ck}">${chart(ser,560,190)}</div>
+      <div class="legend"><span><i class="swatch"></i>Total held in tracked subnets, in TAO</span></div>
+      <p class="sub">The <b>Return</b> above is the change in this line, ignoring money
+      paid in or taken out. The trades on the right are a different question - what it
+      banked when it actually sold. A wallet can be up here while selling badly, or
+      down here while every sale it made was profitable.</p>
     </div>
     <div>
       <h3>Recent trades at a glance</h3>
@@ -341,7 +356,7 @@ function board(){
         row.style.display='';
         row.firstElementChild.innerHTML=detail(ck);
         const box=row.querySelector('.chartbox');
-        if(box) wireChart(box, D.wallets[ck].s);
+        if(box) wireChart(box, windowSeries(D.wallets[ck].s));
         row.scrollIntoView({behavior:'smooth',block:'nearest'});
       }
     });
@@ -409,8 +424,10 @@ best this week; "90 days" rewards consistency over luck.</div>
 <div class="step"><span>3</span><b>Click any row</b> to see that wallet's chart and
 every trade it made - what it bought, when it sold, and what it earned or lost.</div>
 </div>
-<p class="sub" style="margin-top:12px">Return is the gain on the money actually
-invested, so someone who simply deposited more does not appear to be winning.
+<p class="sub" style="margin-top:12px"><b>Return</b> is the gain on the money actually
+invested, so someone who simply deposited more does not appear to be winning. It is a
+different measure from the <b>profit on each sale</b> shown inside a wallet: the first
+tracks what the holdings are worth, the second what was banked when something was sold.
 Wallets that never bought alpha - miners, validators, subnet owners - are left out,
 because their balance grows from running a subnet, not from picking one.</p>
 </div>

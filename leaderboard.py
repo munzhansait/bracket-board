@@ -96,6 +96,16 @@ def _alpha_buyers(conn):
         "WHERE action='BUY' AND COALESCE(is_transfer,0)=0")}
 
 
+# wallet_daily is reconstructed from the positions in holders, so it only
+# covers subnets the sweep has actually crawled. events cover every subnet the
+# wallet traded. Mixing the two subtracts whole-portfolio flows from a partial
+# portfolio: one wallet showed 25.9 TAO of net sales against a 39 TAO balance
+# that never moved, and the chain read +200% for a week that gained 3.7%.
+# Every flow query is therefore restricted to the subnets we actually track.
+TRACKED_SUBNET = ("EXISTS (SELECT 1 FROM holders h "
+                  "WHERE h.coldkey = e.coldkey AND h.netuid = e.netuid)")
+
+
 def _flows_since(conn, day_iso):
     """coldkey -> (net_contribution_tao, trade_count) from events feed.
 
@@ -113,12 +123,14 @@ def _flows_since(conn, day_iso):
     trades_expr = ("SUM(CASE WHEN COALESCE(is_transfer,0)=0 THEN 1 ELSE 0 END)"
                    if have_flag else "COUNT(*)")
     rows = conn.execute("""
-        SELECT coldkey,
-               SUM(CASE WHEN action='BUY' THEN tao_amount
-                        WHEN action='SELL' THEN -tao_amount ELSE 0 END),
+        SELECT e.coldkey,
+               SUM(CASE WHEN e.action='BUY' THEN e.tao_amount
+                        WHEN e.action='SELL' THEN -e.tao_amount ELSE 0 END),
                {}
-        FROM events WHERE substr(timestamp,1,10) >= ?
-        GROUP BY coldkey""".format(trades_expr), (day_iso,)).fetchall()
+        FROM events e WHERE substr(e.timestamp,1,10) >= ? AND {}
+        GROUP BY e.coldkey""".format(
+            trades_expr.replace("is_transfer", "e.is_transfer"), TRACKED_SUBNET),
+        (day_iso,)).fetchall()
     return {ck: (c or 0.0, n or 0) for ck, c, n in rows}
 
 
@@ -166,11 +178,11 @@ def _flows_by_day(conn, since_iso):
     """(coldkey, day) -> net TAO in (+) or out (-) recorded by the feed."""
     out = {}
     for ck, day, net in conn.execute(
-            "SELECT coldkey, substr(timestamp,1,10), "
-            "SUM(CASE WHEN action='BUY' THEN tao_amount "
-            "         WHEN action='SELL' THEN -tao_amount ELSE 0 END) "
-            "FROM events WHERE substr(timestamp,1,10) >= ? "
-            "GROUP BY coldkey, substr(timestamp,1,10)", (since_iso,)):
+            "SELECT e.coldkey, substr(e.timestamp,1,10), "
+            "SUM(CASE WHEN e.action='BUY' THEN e.tao_amount "
+            "         WHEN e.action='SELL' THEN -e.tao_amount ELSE 0 END) "
+            "FROM events e WHERE substr(e.timestamp,1,10) >= ? AND " + TRACKED_SUBNET +
+            " GROUP BY e.coldkey, substr(e.timestamp,1,10)", (since_iso,)):
         out[(ck, day)] = net or 0.0
     return out
 
