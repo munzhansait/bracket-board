@@ -59,8 +59,29 @@ def main():
     ok = True
 
     print("\n[1/2] events  /api/delegation/v1")
-    ok &= show("events", sweep.api_get(
-        conn, "/api/delegation/v1?nominator={}&limit={}&page=1".format(ck, PAGE)))
+    ev_data = sweep.api_get(
+        conn, "/api/delegation/v1?nominator={}&limit={}&page=1".format(ck, PAGE))
+    ok &= show("events", ev_data)
+
+    # Run the real parser over a real record. A field the feed does not use
+    # silently parses to 0, which is how alpha and price stayed empty.
+    if ev_data and ev_data.get("data"):
+        _b, _ts, _ck, _hk, netuid, action, tao, alpha, price = coll.parse_event(
+            ev_data["data"][0])
+        print("    parsed -> action={} netuid={} tao={:.4f} alpha={:.4f} "
+              "price={:.6f}".format(action, netuid, tao, alpha, price))
+        for name, val in (("tao_amount", tao), ("alpha_amount", alpha), ("price", price)):
+            if not val:
+                print("    FAIL parse_event stored 0 for {} - field name mismatch"
+                      .format(name))
+                ok = False
+        if tao and alpha and price:
+            drift = abs(alpha * price - tao) / tao
+            print("    cross-check: alpha*price={:.4f} vs tao={:.4f}  (drift {:.2%})"
+                  .format(alpha * price, tao, drift))
+            if drift > 0.05:
+                print("    FAIL alpha and price do not reconcile with the TAO amount")
+                ok = False
 
     hotkey, netuid = positions[0]
     print("\n[2/2] history /api/dtao/stake_balance/history/v1"

@@ -76,9 +76,11 @@ def parse_event(item):
     except (TypeError, ValueError):
         netuid = -1
     tao = sweep.rao_to_tao(item.get("tao_amount") or item.get("amount"))
-    alpha = sweep.rao_to_tao(item.get("alpha_amount"))
+    # The feed calls these "alpha" and "alpha_price_in_tao"; the older
+    # "alpha_amount"/"rate" names never matched, so both silently stored 0.
+    alpha = sweep.rao_to_tao(item.get("alpha_amount") or item.get("alpha"))
     try:
-        price = float(item.get("rate") or 0)
+        price = float(item.get("rate") or item.get("alpha_price_in_tao") or 0)
     except (TypeError, ValueError):
         price = 0.0
     block = item.get("block_number") or 0
