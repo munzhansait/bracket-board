@@ -24,6 +24,16 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      # The database is no longer in the checkout - it lives on the release.
+      - name: Restore the database
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          gh release download db --repo "$GITHUB_REPOSITORY" \
+            --pattern bracketboard.db --clobber
+          echo "restored $(stat -c%s bracketboard.db) bytes"
+
       - name: Probe one wallet
         env:
           TAOSTATS_API_KEY: ${{ secrets.TAOSTATS_API_KEY }}
