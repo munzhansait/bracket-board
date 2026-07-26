@@ -56,17 +56,36 @@ def ensure_tables(conn):
     conn.execute("CREATE INDEX IF NOT EXISTS ev_day ON events(netuid, timestamp)")
 
 
-def build_price_index(conn):
+def build_price_index(conn, only_days=None):
     """Median traded price per subnet per day, from every wallet's trades.
 
     The median, not the mean: a single fat-fingered or zero-priced record
     should not move the benchmark that everything else is judged against.
+
+    Incremental. A past day's price is settled once trading has moved on, so
+    only days carrying new events are recomputed - scanning the whole events
+    table four times a day would cost more every day, forever, to re-derive
+    numbers that cannot change.
     """
-    conn.execute("DELETE FROM subnet_price")
-    buckets = {}
-    for netuid, day, price in conn.execute(
+    if only_days is None:
+        conn.execute("DELETE FROM subnet_price")
+        cur = conn.execute(
             "SELECT netuid, substr(timestamp,1,10), price FROM events "
-            "WHERE price > 0"):
+            "WHERE price > 0")
+    else:
+        if not only_days:
+            return 0
+        keys = list(only_days)
+        conn.executemany("DELETE FROM subnet_price WHERE netuid=? AND day=?", keys)
+        marks = ",".join("(?,?)" for _ in keys)
+        flat = [x for pair in keys for x in pair]
+        cur = conn.execute(
+            "SELECT netuid, substr(timestamp,1,10), price FROM events "
+            "WHERE price > 0 AND (netuid, substr(timestamp,1,10)) IN "
+            "(VALUES {})".format(marks), flat)
+
+    buckets = {}
+    for netuid, day, price in cur:
         buckets.setdefault((netuid, day), []).append(price)
     rows = []
     for (netuid, day), prices in buckets.items():
@@ -82,6 +101,35 @@ def build_price_index(conn):
         "VALUES(?,?,?,?)", rows)
     conn.commit()
     return len(rows)
+
+
+def _dirty(conn, watermark):
+    """Wallets whose verdict could have changed since the last run.
+
+    Three ways a verdict goes stale, and the third is the one that is easy to
+    miss: new trades of its own, new daily balances of its own, or a new price
+    on a subnet it holds - because the benchmark it is judged against moved
+    even though nothing about the wallet did.
+    """
+    dirty = set()
+    days = set()
+    for ck, netuid, day in conn.execute(
+            "SELECT coldkey, netuid, substr(timestamp,1,10) FROM events "
+            "WHERE rowid > ?", (watermark,)):
+        dirty.add(ck)
+        days.add((netuid, day))
+    if days:
+        subs = {n for n, _d in days}
+        marks = ",".join("?" for _ in subs)
+        for (ck,) in conn.execute(
+                "SELECT DISTINCT coldkey FROM holders WHERE netuid IN ({})"
+                .format(marks), list(subs)):
+            dirty.add(ck)
+    for (ck,) in conn.execute(
+            "SELECT DISTINCT coldkey FROM wallet_daily WHERE day > "
+            "COALESCE((SELECT value FROM meta WHERE key='qualify_last_day'),'')"):
+        dirty.add(ck)
+    return dirty, days
 
 
 def _positions(conn):
@@ -112,10 +160,31 @@ def _flows(conn):
     return out
 
 
-def qualify(conn, verbose=True):
-    """Score every wallet against the market and record the verdict."""
+def qualify(conn, verbose=True, full=None):
+    """Score wallets against the market and record the verdict.
+
+    Incremental by default: only wallets whose inputs moved are rescored, and
+    a verdict already on file stands until something it depends on changes.
+    Pass full=True (or set QUALIFY_FULL=1) after changing a threshold, when
+    every stored verdict was reached under rules that no longer apply.
+    """
     ensure_tables(conn)
-    priced = build_price_index(conn)
+    if full is None:
+        full = os.environ.get("QUALIFY_FULL", "") == "1"
+    have = conn.execute("SELECT COUNT(*) FROM wallet_quality").fetchone()[0]
+    full = full or not have
+
+    watermark = int(sweep.meta_get(conn, "qualify_event_rowid", "0") or 0)
+    if full:
+        targets, changed_days = None, None
+    else:
+        targets, changed_days = _dirty(conn, watermark)
+        if not targets:
+            if verbose:
+                print("Qualification: nothing changed since the last run.")
+            return []
+
+    priced = build_price_index(conn, changed_days)
     prices = {(n, d): p for n, d, p in conn.execute(
         "SELECT netuid, day, price FROM subnet_price")}
     positions = _positions(conn)
@@ -124,9 +193,12 @@ def qualify(conn, verbose=True):
     series = {}
     for ck, day, tao in conn.execute(
             "SELECT coldkey, day, total_tao FROM wallet_daily ORDER BY coldkey, day"):
-        series.setdefault(ck, []).append((day, tao or 0.0))
+        if targets is None or ck in targets:
+            series.setdefault(ck, []).append((day, tao or 0.0))
 
-    conn.execute("DELETE FROM wallet_day_exception")
+    if full:
+        conn.execute("DELETE FROM wallet_day_exception")
+        conn.execute("DELETE FROM wallet_quality")
     verdicts, exceptions = [], []
     stamp = datetime.now(timezone.utc).isoformat()
 
@@ -173,23 +245,37 @@ def qualify(conn, verbose=True):
         else:
             verdicts.append((ck, "good", "", checked, bad, worst, stamp))
 
-    conn.execute("DELETE FROM wallet_quality")
+    # Rescored wallets have their old verdict and exceptions replaced; every
+    # other wallet keeps the verdict already on file.
+    if not full and verdicts:
+        rescored = [(v[0],) for v in verdicts]
+        conn.executemany("DELETE FROM wallet_quality WHERE coldkey=?", rescored)
+        conn.executemany("DELETE FROM wallet_day_exception WHERE coldkey=?", rescored)
     conn.executemany(
         "INSERT INTO wallet_quality(coldkey,verdict,reason,days_checked,"
         "days_bad,worst_residual,checked_at) VALUES(?,?,?,?,?,?,?)", verdicts)
     conn.executemany(
         "INSERT OR REPLACE INTO wallet_day_exception"
         "(coldkey,day,expected,actual,residual) VALUES(?,?,?,?,?)", exceptions)
+
+    top = conn.execute("SELECT MAX(rowid), MAX(day) FROM events, "
+                       "(SELECT MAX(day) day FROM wallet_daily)").fetchone()
+    sweep.meta_set(conn, "qualify_event_rowid", top[0] or 0)
+    sweep.meta_set(conn, "qualify_last_day", top[1] or "")
     conn.commit()
 
     if verbose:
         from collections import Counter
         tally = Counter(v[1] for v in verdicts)
-        print("Qualification: {} subnet-days priced, {} wallets scored".format(
-            priced, len(verdicts)))
+        print("Qualification ({}): {} subnet-days repriced, {} wallets scored"
+              .format("full" if full else "incremental", priced, len(verdicts)))
         for k, n in tally.most_common():
             print("   {:14s} {}".format(k, n))
         print("   {} day-level exceptions recorded".format(len(exceptions)))
+        standing = conn.execute(
+            "SELECT verdict, COUNT(*) FROM wallet_quality GROUP BY verdict")
+        print("   register now: " + ", ".join(
+            "{} {}".format(n, v) for v, n in standing))
     return verdicts
 
 
