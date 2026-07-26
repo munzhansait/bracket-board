@@ -1,0 +1,35 @@
+name: "Probe - one wallet API check"
+
+on:
+  workflow_dispatch:
+    inputs:
+      coldkey:
+        description: "Coldkey to probe (blank = largest holder)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: probe            # deliberately NOT the sweep group, so it can run
+  cancel-in-progress: false   # alongside a long backfill instead of queueing
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Probe one wallet
+        env:
+          TAOSTATS_API_KEY: ${{ secrets.TAOSTATS_API_KEY }}
+          PROBE_COLDKEY: ${{ inputs.coldkey }}
+          PACE_SECONDS: "1.1"
+          CALLS_PER_RUN: "4"           # hard cap: this must stay cheap
+          MONTHLY_CEILING: "48000"
+          PYTHONUNBUFFERED: "1"
+        run: python probe.py
