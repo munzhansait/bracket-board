@@ -44,6 +44,10 @@ MIN_BASELINE_TAO = 1.0
 TOP_N = 10
 MIN_SUBNETS = 2          # spread across subnets, OR...
 MIN_TRADES = 4           # ...more than 3 trades in the window
+MAX_STEP_RATIO = 3.0     # a single step moving more than 3x is a cash flow
+MIN_STEPS = 3            # need a few linked snapshots to chain a return
+MAX_DROPPED_SHARE = 0.5  # too many unexplained jumps -> do not rank at all
+MIN_STEP_TAO = 1.0       # ignore growth measured off a near-empty wallet
 
 
 def _snapshot_at_or_before(conn, day_iso, max_age_days):
@@ -144,6 +148,63 @@ def _owners(conn):
         "SELECT owner_ss58 FROM subnets WHERE owner_ss58 != ''")}
 
 
+def _daily_series(conn, since_iso):
+    """coldkey -> [(day, total_tao), ...] ascending, from since_iso onwards."""
+    series = {}
+    for ck, day, tao in conn.execute(
+            "SELECT coldkey, day, total_tao FROM wallet_daily WHERE day >= ? "
+            "ORDER BY coldkey, day", (since_iso,)):
+        series.setdefault(ck, []).append((day, tao or 0.0))
+    return series
+
+
+def _flows_by_day(conn, since_iso):
+    """(coldkey, day) -> net TAO in (+) or out (-) recorded by the feed."""
+    out = {}
+    for ck, day, net in conn.execute(
+            "SELECT coldkey, substr(timestamp,1,10), "
+            "SUM(CASE WHEN action='BUY' THEN tao_amount "
+            "         WHEN action='SELL' THEN -tao_amount ELSE 0 END) "
+            "FROM events WHERE substr(timestamp,1,10) >= ? "
+            "GROUP BY coldkey, substr(timestamp,1,10)", (since_iso,)):
+        out[(ck, day)] = net or 0.0
+    return out
+
+
+def time_weighted_return(series, flows, ck):
+    """Chain day-over-day growth, discarding steps that are really cash flows.
+
+    Modified Dietz needs every deposit and withdrawal, and this feed does not
+    provide them: a stake transfer is recorded against the sender's coldkey,
+    so money arriving in a wallet is invisible on that wallet. One observed
+    wallet jumped 4.92 -> 2400.38 TAO overnight with 53 TAO of recorded flow,
+    and Dietz scored it +8574%.
+
+    So subtract the flows we do know about, and treat any step that still
+    moves more than MAX_STEP_RATIO as an unrecorded flow rather than as
+    performance - dropping that step from the chain instead of believing it.
+    Returns (return_fraction, pnl_tao, steps_used, steps_dropped).
+    """
+    growth, pnl, used, dropped = 1.0, 0.0, 0, 0
+    for i in range(1, len(series)):
+        _d0, v0 = series[i - 1]
+        d1, v1 = series[i]
+        # A percentage measured off a near-empty wallet is noise: one wallet
+        # emptied to 0.12 TAO and rebuilt, and chaining those steps scored it
+        # +2289% off moves worth a fraction of a TAO.
+        if v0 < MIN_STEP_TAO:
+            dropped += 1
+            continue
+        ratio = (v1 - flows.get((ck, d1), 0.0)) / v0
+        if ratio <= 0 or ratio > MAX_STEP_RATIO or ratio < 1.0 / MAX_STEP_RATIO:
+            dropped += 1
+            continue
+        growth *= ratio
+        pnl += v0 * (ratio - 1.0)
+        used += 1
+    return growth - 1.0, pnl, used, dropped
+
+
 def compute_board(conn, window_days, brackets, bracket_of):
     """Returns (status, per_bracket) where per_bracket maps label -> rows.
     Row: (coldkey, ret_pct, pnl_tao, value_now, subnets, trades, adjusted)"""
@@ -173,7 +234,8 @@ def compute_board(conn, window_days, brackets, bracket_of):
         return ("no-data", {})
     current = _current_values(conn)
     flows = _flows_since(conn, target)
-    coverage = _events_coverage_by_wallet(conn)
+    series_all = _daily_series(conn, target)
+    per_day = _flows_by_day(conn, target)
     owners = _owners(conn)
     buyers = _alpha_buyers(conn)
 
@@ -184,29 +246,23 @@ def compute_board(conn, window_days, brackets, bracket_of):
         if ck not in buyers:
             continue  # never bought alpha - operator or emission recipient
         v1, subs = current.get(ck, (0.0, 0))
-        contrib, trades = flows.get(ck, (0.0, 0))
+        _contrib, trades = flows.get(ck, (0.0, 0))
         if subs < MIN_SUBNETS and trades < MIN_TRADES:
             continue
-        # Only trust the flow adjustment if this wallet's own events reach
-        # back past the window start.
-        cov = coverage.get(ck)
-        adjusted = bool(cov and cov <= target)
-        if not adjusted and abs(contrib) > 0:
-            # Known flows inside the window but incomplete history before it:
-            # the raw number would read a deposit as performance. Drop it
-            # rather than publish a figure that flatters the wallet.
+        series = series_all.get(ck) or []
+        if len(series) < MIN_STEPS + 1:
+            continue  # too few snapshots in this window to chain a return
+        ret_frac, pnl, used, dropped = time_weighted_return(series, per_day, ck)
+        if used < MIN_STEPS:
             continue
-        c = contrib if adjusted else 0.0
-        denom = v0 + max(c, 0.0) / 2.0
-        if denom <= 0:
-            continue
-        pnl = v1 - v0 - c
-        ret = 100.0 * pnl / denom
-        if ret > 10000:      # data glitch guard
+        # A wallet whose series is mostly unexplained jumps is being driven by
+        # transfers we cannot see; ranking it would be guesswork.
+        if dropped > used * MAX_DROPPED_SHARE:
             continue
         label = bracket_of(v1 if v1 > 0 else v0)
         if label:
-            per_bracket[label].append((ck, ret, pnl, v1, subs, trades, adjusted))
+            per_bracket[label].append(
+                (ck, 100.0 * ret_frac, pnl, v1, subs, trades, dropped == 0))
 
     for label in per_bracket:
         per_bracket[label] = sorted(per_bracket[label], key=lambda r: -r[1])[:TOP_N]
