@@ -52,6 +52,7 @@ MAX_PNL_VS_PEAK = 3.0    # profit far beyond the largest balance ever held is
                          # arithmetically impossible without unseen deposits
 MIN_WINDOW_TAO = 1.0     # a wallet that emptied out mid-window is not ranked
 MAX_PLAUSIBLE_RETURN = 2000.0   # above this it is an artefact, not a trader
+MIN_RISKED_TAO = 1.0     # closed trades must have tied up at least this much
 MAX_GAP_DAYS = 2         # a hole in the daily history disqualifies the window
 MAX_FLOW_VS_START = 2.0  # more money moving than invested -> no honest return
 METHOD_TOLERANCE_PP = 2.0    # the two methods may differ by this many points...
@@ -252,6 +253,20 @@ def _traded_vs_tracked(conn, day_iso):
     return missing
 
 
+def _realised(conn, ck, since_iso):
+    """TAO actually banked by selling inside the window.
+
+    Uses the same cost-basis walk the wallet page prints, so the column and
+    the trade list can never tell different stories.
+    """
+    try:
+        import dashboard
+        return sum(t["pnl"] or 0.0
+                   for t in dashboard.realized_trades(conn, ck, since_iso))
+    except Exception:
+        return 0.0
+
+
 def _window_flows(conn, day_iso):
     """coldkey -> (bought_tao, sold_tao, transferred_net_tao) inside the window.
 
@@ -349,6 +364,84 @@ def audit(ck, series, per_day, flows_win, untracked, coverage, target,
     }
 
 
+def realised_board(conn, window_days, brackets, bracket_of):
+    """Wallets ranked on money actually banked by selling, inside the window.
+
+    A deliberately different standard from the total-return board, because the
+    two measures depend on different evidence. Total return needs a trustworthy
+    balance series, which means every position must be tracked - and that rule
+    excludes precisely the wallets that trade most, since an active trader is
+    the one most likely to touch a subnet the crawl has not reached. Ranking
+    banked money by that standard left 739 wallets with priced sales unable to
+    appear on any board.
+
+    Realised profit needs none of it. What a sale banked is the price it went
+    out at against the average price paid, both of which come from the trade
+    record alone; no balance, no coverage of other subnets, nothing inferred.
+    So this board asks only for a complete trade history and priced sales, and
+    measures return against the capital those closed trades actually tied up.
+    """
+    from collections import Counter
+    if not window_days:
+        return ("no-data", {}, {})
+    target = (date.today() - timedelta(days=window_days)).isoformat()
+
+    coverage = _events_coverage_by_wallet(conn)
+    owners = _owners(conn)
+    buyers = _alpha_buyers(conn)
+    current = _current_values(conn)
+    try:
+        import dashboard
+    except Exception:
+        return ("no-data", {}, {})
+
+    active = [r[0] for r in conn.execute(
+        "SELECT coldkey FROM events WHERE substr(timestamp,1,10) >= ? "
+        "AND COALESCE(is_transfer,0)=0 AND action='SELL' AND price > 0 "
+        "GROUP BY coldkey", (target,))]
+
+    per_bracket = {label: [] for label, _, _ in brackets}
+    exceptions = Counter()
+    for ck in active:
+        if ck in owners:
+            exceptions["subnet owner"] += 1
+            continue
+        if ck not in buyers:
+            exceptions["never bought alpha"] += 1
+            continue
+        cov = coverage.get(ck)
+        if not cov or cov > target:
+            exceptions["trade history starts after the window"] += 1
+            continue
+        trades = dashboard.realized_trades(conn, ck, target)
+        sells = [t for t in trades if t["pnl"] is not None and t["cost"]]
+        if not sells:
+            exceptions["no sale we can price"] += 1
+            continue
+        banked = sum(t["pnl"] for t in sells)
+        risked = sum(t["cost"] for t in sells)
+        if risked < MIN_RISKED_TAO:
+            # A percentage off a fraction of a TAO is arithmetic, not skill:
+            # +163% on 0.02 TAO risked is two pence and would top the board.
+            exceptions["too little capital at risk to rank"] += 1
+            continue
+        v1, subs = current.get(ck, (0.0, 0))
+        label = bracket_of(v1)
+        if not label:
+            exceptions["outside every size bracket"] += 1
+            continue
+        per_bracket[label].append({
+            "ck": ck, "realised": banked, "risked": risked,
+            "realised_pct": 100.0 * banked / risked, "sells": len(sells),
+            "v": v1, "subs": subs, "trades": len(trades), "target": target,
+        })
+
+    for label in per_bracket:
+        per_bracket[label] = sorted(
+            per_bracket[label], key=lambda r: -r["realised_pct"])[:TOP_N]
+    return ("ok", per_bracket, dict(exceptions))
+
+
 def compute_board(conn, window_days, brackets, bracket_of):
     status, per_bracket, _ex = audited_board(conn, window_days, brackets, bracket_of)
     return status, per_bracket
@@ -420,13 +513,28 @@ def audited_board(conn, window_days, brackets, bracket_of):
         if not label:
             exceptions["outside every size bracket"] += 1
             continue
+        # What the wallet actually banked by selling inside this window, and
+        # that as a share of the capital it started with. Ranking on total
+        # return alone put holders at the top of every board and buried anyone
+        # who traded and took money off the table - 739 wallets had priced
+        # sales in a 30-day window and none of them led a single bracket.
+        sales = _realised(conn, ck, target)
+        rec["realised"] = sales
+        rec["realised_pct"] = (100.0 * sales / rec["start"]
+                               if rec["start"] > 0 else 0.0)
         rec.update({"ck": ck, "v": v1, "subs": subs, "trades": trades,
                     "target": target})
         per_bracket[label].append(rec)
 
+    # Keep the best of both rankings. A reader after the strongest holder and a
+    # reader after the strongest trader are asking different questions, and
+    # neither should be answered with the other's list.
     for label in per_bracket:
-        per_bracket[label] = sorted(
-            per_bracket[label], key=lambda r: -r["ret"])[:TOP_N]
+        rows = per_bracket[label]
+        keep = {id(r): r for r in sorted(rows, key=lambda r: -r["ret"])[:TOP_N]}
+        keep.update({id(r): r for r in
+                     sorted(rows, key=lambda r: -r["realised_pct"])[:TOP_N]})
+        per_bracket[label] = sorted(keep.values(), key=lambda r: -r["ret"])
     return ("ok", per_bracket, dict(exceptions))
 
 
