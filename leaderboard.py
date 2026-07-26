@@ -44,10 +44,14 @@ MIN_BASELINE_TAO = 1.0
 TOP_N = 10
 MIN_SUBNETS = 2          # spread across subnets, OR...
 MIN_TRADES = 4           # ...more than 3 trades in the window
-MAX_STEP_RATIO = 3.0     # a single step moving more than 3x is a cash flow
+MAX_STEP_RATIO = 2.0     # a step that doubles in a day is a cash flow, not a gain
 MIN_STEPS = 3            # need a few linked snapshots to chain a return
-MAX_DROPPED_SHARE = 0.5  # too many unexplained jumps -> do not rank at all
+MAX_DROPPED_SHARE = 0.25  # too many unexplained jumps -> do not rank at all
 MIN_STEP_TAO = 1.0       # ignore growth measured off a near-empty wallet
+MAX_PNL_VS_PEAK = 3.0    # profit far beyond the largest balance ever held is
+                         # arithmetically impossible without unseen deposits
+MIN_WINDOW_TAO = 1.0     # a wallet that emptied out mid-window is not ranked
+MAX_PLAUSIBLE_RETURN = 2000.0   # above this it is an artefact, not a trader
 
 
 def _snapshot_at_or_before(conn, day_iso, max_age_days):
@@ -259,10 +263,26 @@ def compute_board(conn, window_days, brackets, bracket_of):
         # transfers we cannot see; ranking it would be guesswork.
         if dropped > used * MAX_DROPPED_SHARE:
             continue
+        # Coherence check. Chained percentages can compound into fantasy while
+        # the wallet stays small - one 36 TAO wallet came out at +71370% with a
+        # claimed profit of 865 TAO. You cannot earn many times the largest
+        # balance you ever held unless money arrived that we never saw.
+        values = [v for _d, v in series]
+        peak = max(values)
+        if peak <= 0 or abs(pnl) > MAX_PNL_VS_PEAK * peak:
+            continue
+        # A wallet that emptied out and re-entered has no meaningful percentage
+        # for the window: chaining growth off a near-zero base compounded one
+        # of these to +4,293,349%. Rank only wallets that stayed invested.
+        if min(values) < MIN_WINDOW_TAO:
+            continue
+        ret_pct = 100.0 * ret_frac
+        if abs(ret_pct) > MAX_PLAUSIBLE_RETURN:
+            continue  # backstop: no real wallet, only undetected flows
         label = bracket_of(v1 if v1 > 0 else v0)
         if label:
             per_bracket[label].append(
-                (ck, 100.0 * ret_frac, pnl, v1, subs, trades, dropped == 0))
+                (ck, ret_pct, pnl, v1, subs, trades, dropped == 0))
 
     for label in per_bracket:
         per_bracket[label] = sorted(per_bracket[label], key=lambda r: -r[1])[:TOP_N]
