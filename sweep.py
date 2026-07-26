@@ -12,8 +12,11 @@ What this does on every scheduled run:
   4. Regenerates docs/index.html - the public dashboard.
 
 Design constraints honoured:
-  - taostats free tier: 5 calls/min, 10k calls/month.
-    We pace at ~1 call / 13s and hard-stop near a monthly ceiling.
+  - Pace and ceiling come from the workflow (PACE_SECONDS, CALLS_PER_RUN,
+    MONTHLY_CEILING). Defaults suit the free tier (5 calls/min, 10k/month);
+    the workflows override them for the paid Standard tier (60/min, 50k).
+    The monthly counter is SHARED by sweep/collector/backfill, so every
+    workflow must pass the same MONTHLY_CEILING or the lower one starves.
   - Only Python standard library. State lives in bracketboard.db
     (SQLite) which the workflow commits back to the repository.
 """

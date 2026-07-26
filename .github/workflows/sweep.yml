@@ -28,6 +28,9 @@ jobs:
       - name: Run the sweep
         env:
           TAOSTATS_API_KEY: ${{ secrets.TAOSTATS_API_KEY }}
+          PACE_SECONDS: "1.1"          # Standard tier pace (60/min)
+          CALLS_PER_RUN: "200"         # 4 runs/day -> ~24k/month
+          MONTHLY_CEILING: "48000"     # shared pool cap; must match every workflow
         run: python sweep.py
 
       - name: Save results back to the repository

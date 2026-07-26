@@ -33,7 +33,9 @@ jobs:
           GMAIL_ADDRESS: ${{ secrets.GMAIL_ADDRESS }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           ALERT_EMAIL_TO: ${{ secrets.ALERT_EMAIL_TO }}
+          PACE_SECONDS: "1.1"          # Standard tier pace (60/min)
           CALLS_PER_RUN: "6"
+          MONTHLY_CEILING: "48000"     # shared pool cap; must match every workflow
         run: python collector.py
 
       - name: Save results back to the repository
