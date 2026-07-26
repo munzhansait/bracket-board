@@ -1,0 +1,7 @@
+# Bracket Board watchlist
+# Paste one coldkey wallet address per line (edit this file on GitHub:
+# open it -> pencil icon -> paste -> Commit changes).
+# Lines starting with # are ignored.
+#
+# Example (remove the # to activate):
+# 5HCFWvRqzSHWRPecN7q8J6c7aKQnrCZTMHstPv39xL1wgDHh

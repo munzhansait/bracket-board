@@ -31,7 +31,7 @@ BASE = "https://api.taostats.io"
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bracketboard.db")
 DOCS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "docs")
 
-CALLS_PER_RUN = int(os.environ.get("CALLS_PER_RUN", "60"))
+CALLS_PER_RUN = int(os.environ.get("CALLS_PER_RUN", "40"))
 MONTHLY_CEILING = int(os.environ.get("MONTHLY_CEILING", "9000"))
 PAUSE_SECONDS = 13.2
 PAGE_SIZE = 200
@@ -260,18 +260,49 @@ def continue_sweep(conn):
 
 
 def finalize_generation(conn, generation):
-    """A full pass finished: purge stale rows, snapshot wallet totals."""
+    """A full pass finished: purge stale rows, snapshot wallet totals.
+
+    v1.1: delta snapshots + retention thinning to keep the DB small.
+      - A wallet gets a new daily row only if its total changed
+        meaningfully (>0.5% or >0.1 TAO) or it has no row yet.
+      - Daily detail is kept ~100 days; older rows thin to Mondays.
+    """
     print("Full sweep pass {} complete - snapshotting wallets.".format(generation))
     conn.execute("DELETE FROM holders WHERE generation < ?", (generation,))
     today = date.today().isoformat()
+
+    previous = dict(conn.execute("""
+        SELECT wd.coldkey, wd.total_tao FROM wallet_daily wd
+        JOIN (SELECT coldkey, MAX(day) AS d FROM wallet_daily GROUP BY coldkey) m
+          ON m.coldkey = wd.coldkey AND m.d = wd.day""").fetchall())
+
+    current = conn.execute("""
+        SELECT coldkey, SUM(balance_tao), COUNT(DISTINCT netuid)
+        FROM holders GROUP BY coldkey""").fetchall()
+
+    written = 0
+    for coldkey, total, subs in current:
+        total = total or 0.0
+        prev = previous.get(coldkey)
+        changed = (prev is None
+                   or abs(total - prev) > max(0.1, abs(prev) * 0.005))
+        if changed:
+            conn.execute(
+                "INSERT INTO wallet_daily(day,coldkey,total_tao,subnets) VALUES(?,?,?,?) "
+                "ON CONFLICT(day,coldkey) DO UPDATE SET "
+                "total_tao=excluded.total_tao, subnets=excluded.subnets",
+                (today, coldkey, total, subs))
+            written += 1
+    print("  snapshot rows written: {} of {} wallets (delta mode)".format(
+        written, len(current)))
+
     conn.execute("""
-        INSERT INTO wallet_daily(day, coldkey, total_tao, subnets)
-        SELECT ?, coldkey, SUM(balance_tao), COUNT(DISTINCT netuid)
-        FROM holders GROUP BY coldkey
-        ON CONFLICT(day, coldkey) DO UPDATE SET
-          total_tao=excluded.total_tao, subnets=excluded.subnets""", (today,))
+        DELETE FROM wallet_daily
+        WHERE day < date('now','-100 days') AND strftime('%w', day) != '1'""")
+
     meta_set(conn, "last_full_sweep", datetime.now(timezone.utc).isoformat())
     conn.commit()
+    conn.execute("VACUUM")
 
 
 # --------------------------- dashboard ----------------------------------
