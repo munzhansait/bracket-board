@@ -14,8 +14,13 @@ show a countdown instead of misleading numbers.
 Skill filters applied to every board:
   - subnet owners excluded (operators, not investors)
   - baseline portfolio >= 1 TAO
-  - activity requirement: position in >= 2 subnets OR >= 2 trades in
-    the window (single lucky-bet wallets are suppressed)
+  - activity requirement: position in >= 2 subnets OR more than 3 trades
+    in the window (single lucky-bet wallets are suppressed)
+
+Every board is recomputed from scratch on each run, so a wallet that
+starts losing drops down or off it, and a newly discovered wallet that
+performs well appears as soon as it has enough snapshot history to fill
+the window. There is no sticky incumbent list.
 """
 
 from datetime import date, timedelta
@@ -32,6 +37,8 @@ WINDOWS = [
 TOLERANCE_DAYS = 3       # snapshot may be up to this much older than target
 MIN_BASELINE_TAO = 1.0
 TOP_N = 10
+MIN_SUBNETS = 2          # spread across subnets, OR...
+MIN_TRADES = 4           # ...more than 3 trades in the window
 
 
 def _snapshot_at_or_before(conn, day_iso):
@@ -107,7 +114,7 @@ def compute_board(conn, window_days, brackets, bracket_of):
             continue
         v1, subs = current.get(ck, (0.0, 0))
         contrib, trades = flows.get(ck, (0.0, 0))
-        if subs < 2 and trades < 2:
+        if subs < MIN_SUBNETS and trades < MIN_TRADES:
             continue
         adjusted = flows_cover_window
         c = contrib if adjusted else 0.0
@@ -133,8 +140,10 @@ def render_html(conn, brackets, bracket_of, esc):
              "brackets. Adjusted for deposits/withdrawals where the event feed covers "
              "the window (&#10003; in Adj column); otherwise raw balance change. "
              "Skill filters: subnet owners excluded, baseline &ge; 1 TAO, and "
-             "&ge;2 subnets or &ge;2 trades required. Past performance is not a "
-             "prediction. Not financial advice.</div>"]
+             "&ge;2 subnets or &gt;3 trades required. Rebuilt from scratch every "
+             "run, so wallets that start losing drop off and newly discovered "
+             "wallets appear as soon as they have enough history. Past performance "
+             "is not a prediction. Not financial advice.</div>"]
     for wname, wdays in WINDOWS:
         status, boards = compute_board(conn, wdays, brackets, bracket_of)
         parts.append("<h2>{}</h2>".format(esc(wname)))
