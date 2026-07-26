@@ -1,0 +1,40 @@
+name: "Phase 1 - Sweep and Bracket"
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 0,6,12,18 * * *"   # four times a day (UTC)
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sweep
+  cancel-in-progress: false
+
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Get the code and database
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run the sweep
+        env:
+          TAOSTATS_API_KEY: ${{ secrets.TAOSTATS_API_KEY }}
+        run: python sweep.py
+
+      - name: Save results back to the repository
+        run: |
+          git config user.name "bracket-board-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add bracketboard.db docs/index.html
+          git diff --cached --quiet || git commit -m "Sweep update $(date -u +'%Y-%m-%d %H:%M')"
+          git pull --rebase origin ${GITHUB_REF_NAME} || true
+          git push
