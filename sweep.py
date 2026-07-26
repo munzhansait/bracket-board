@@ -318,7 +318,41 @@ def bracket_of(total):
 
 
 def build_dashboard(conn):
+    """Write docs/index.html.
+
+    Delegates to dashboard.py. If anything in there fails, fall back to the
+    plain holdings table below rather than leaving the site without a page.
+    """
     os.makedirs(DOCS_DIR, exist_ok=True)
+    try:
+        import dashboard
+        import leaderboard
+        state = json.loads(meta_get(conn, "sweep_state", "{}"))
+        ranked = conn.execute(
+            "SELECT COUNT(*) FROM backfill_done WHERE history_done=1").fetchone()[0]
+        meta = dashboard.meta_line(
+            datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"),
+            len(state.get("done", [])),
+            conn.execute("SELECT COUNT(*) FROM subnets").fetchone()[0],
+            str(meta_get(conn, "last_full_sweep", "never"))[:16],
+            meta_get(conn, "calls_" + month_key(), "0"), MONTHLY_CEILING,
+            conn.execute("SELECT COUNT(DISTINCT day) FROM wallet_daily").fetchone()[0],
+            ranked)
+        html = dashboard.render(conn, BRACKETS, bracket_of,
+                                leaderboard.compute_board, leaderboard.WINDOWS, meta)
+        with open(os.path.join(DOCS_DIR, "index.html"), "w", encoding="utf-8") as f:
+            f.write(html)
+        print("Dashboard regenerated ({} KB).".format(len(html) // 1024))
+        return
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        print("Rich dashboard failed ({}); writing the fallback page.".format(e))
+
+    _build_fallback_dashboard(conn)
+
+
+def _build_fallback_dashboard(conn):
     owners = {r[0] for r in conn.execute(
         "SELECT owner_ss58 FROM subnets WHERE owner_ss58 != ''")}
     wallets = conn.execute("""
