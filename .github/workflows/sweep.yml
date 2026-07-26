@@ -12,12 +12,15 @@ concurrency:
   group: sweep
   cancel-in-progress: false
 
+env:
+  DB_TAG: db                 # release asset holding bracketboard.db
+
 jobs:
   sweep:
     runs-on: ubuntu-latest
     timeout-minutes: 40
     steps:
-      - name: Get the code and database
+      - name: Get the code
         uses: actions/checkout@v4
 
       - name: Set up Python
@@ -25,19 +28,55 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Restore the database
+        id: restore
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          if gh release view "$DB_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            # No "|| true" here. If the release exists, a failed download must
+            # stop the job: carrying on would build a fresh empty database and
+            # the save step would then overwrite the real one with it.
+            gh release download "$DB_TAG" --repo "$GITHUB_REPOSITORY" \
+              --pattern bracketboard.db --clobber
+            echo "restored $(stat -c%s bracketboard.db) bytes"
+          else
+            echo "No database release yet - starting a new database."
+          fi
+          echo "ready=1" >> "$GITHUB_OUTPUT"
+
       - name: Run the sweep
         env:
           TAOSTATS_API_KEY: ${{ secrets.TAOSTATS_API_KEY }}
           PACE_SECONDS: "1.1"          # Standard tier pace (60/min)
           CALLS_PER_RUN: "200"         # 4 runs/day -> ~24k/month
           MONTHLY_CEILING: "48000"     # shared pool cap; must match every workflow
+          PYTHONUNBUFFERED: "1"
         run: python sweep.py
 
-      - name: Save results back to the repository
+      # always(): a cancelled or timed-out run has still done real, paid-for
+      # work that SQLite has already committed to the file. Save it rather
+      # than throw it away, which is what the old git-commit step did.
+      - name: Save the database
+        if: always() && steps.restore.outputs.ready == '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          [ -s bracketboard.db ] || { echo "database missing or empty; refusing to upload"; exit 1; }
+          gh release view "$DB_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
+            gh release create "$DB_TAG" --repo "$GITHUB_REPOSITORY" \
+              --title "Bracket Board database" --notes "Rolling SQLite database."
+          gh release upload "$DB_TAG" bracketboard.db --repo "$GITHUB_REPOSITORY" --clobber
+          echo "saved $(stat -c%s bracketboard.db) bytes"
+
+      - name: Publish the dashboard
+        if: always() && steps.restore.outputs.ready == '1'
         run: |
           git config user.name "bracket-board-bot"
           git config user.email "actions@users.noreply.github.com"
-          git add bracketboard.db docs/index.html
+          git add docs/index.html
           git diff --cached --quiet || git commit -m "Sweep update $(date -u +'%Y-%m-%d %H:%M')"
           git pull --rebase --autostash origin ${GITHUB_REF_NAME}
           git push

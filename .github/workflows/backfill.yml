@@ -15,6 +15,9 @@ concurrency:
   group: sweep
   cancel-in-progress: false
 
+env:
+  DB_TAG: db
+
 jobs:
   backfill:
     runs-on: ubuntu-latest
@@ -24,6 +27,22 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
+      - name: Restore the database
+        id: restore
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          if gh release view "$DB_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release download "$DB_TAG" --repo "$GITHUB_REPOSITORY" \
+              --pattern bracketboard.db --clobber
+            echo "restored $(stat -c%s bracketboard.db) bytes"
+          else
+            echo "No database release yet - starting a new database."
+          fi
+          echo "ready=1" >> "$GITHUB_OUTPUT"
+
       - name: Run backfill
         env:
           TAOSTATS_API_KEY: ${{ secrets.TAOSTATS_API_KEY }}
@@ -32,13 +51,26 @@ jobs:
           MONTHLY_CEILING: "48000"     # Standard tier: 50k/month
           PYTHONUNBUFFERED: "1"        # stream the log live; don't block-buffer
         run: python backfill.py
-      - name: Save results
+
+      # This is the run most worth saving on cancellation: hours of paced,
+      # paid-for calls are already committed to the file by the time anyone
+      # stops it.
+      - name: Save the database
+        if: always() && steps.restore.outputs.ready == '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          [ -s bracketboard.db ] || { echo "database missing or empty; refusing to upload"; exit 1; }
+          gh release upload "$DB_TAG" bracketboard.db --repo "$GITHUB_REPOSITORY" --clobber
+          echo "saved $(stat -c%s bracketboard.db) bytes"
+
+      - name: Publish the dashboard
+        if: always() && steps.restore.outputs.ready == '1'
         run: |
           git config user.name "bracket-board-bot"
           git config user.email "actions@users.noreply.github.com"
-          git add bracketboard.db docs/index.html
+          git add docs/index.html
           git diff --cached --quiet || git commit -m "Backfill $(date -u +'%Y-%m-%d %H:%M')"
-          # --autostash: any leftover unstaged change would otherwise abort the
-          # rebase, and the old "|| true" then swallowed it and pushed anyway.
           git pull --rebase --autostash origin ${GITHUB_REF_NAME}
           git push

@@ -1,0 +1,9 @@
+# The database lives in the "db" release, not in git. Committing a multi-MB
+# binary on every collector run (72 a day) bloated the repository, and a
+# fully backfilled database would exceed GitHub's hard 100 MB file limit.
+bracketboard.db
+bracketboard.db-journal
+bracketboard.db-wal
+
+__pycache__/
+*.pyc

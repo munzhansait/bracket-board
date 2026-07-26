@@ -6,24 +6,42 @@ on:
     - cron: "*/20 * * * *"   # every 20 minutes (best-effort)
 
 permissions:
-  contents: write
+  contents: write            # needed to replace the database release asset
 
 concurrency:
   group: sweep            # same group as the sweep = never run at the same time
   cancel-in-progress: false
+
+env:
+  DB_TAG: db
 
 jobs:
   collect:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - name: Get the code and database
+      - name: Get the code
         uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
+      - name: Restore the database
+        id: restore
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          if gh release view "$DB_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release download "$DB_TAG" --repo "$GITHUB_REPOSITORY" \
+              --pattern bracketboard.db --clobber
+            echo "restored $(stat -c%s bracketboard.db) bytes"
+          else
+            echo "No database release yet - starting a new database."
+          fi
+          echo "ready=1" >> "$GITHUB_OUTPUT"
 
       - name: Run the collector
         env:
@@ -36,13 +54,17 @@ jobs:
           PACE_SECONDS: "1.1"          # Standard tier pace (60/min)
           CALLS_PER_RUN: "6"
           MONTHLY_CEILING: "48000"     # shared pool cap; must match every workflow
+          PYTHONUNBUFFERED: "1"
         run: python collector.py
 
-      - name: Save results back to the repository
+      # This job writes no files to the repository - only the database - so
+      # there is nothing to commit here any more.
+      - name: Save the database
+        if: always() && steps.restore.outputs.ready == '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          git config user.name "bracket-board-bot"
-          git config user.email "actions@users.noreply.github.com"
-          git add bracketboard.db
-          git diff --cached --quiet || git commit -m "Collector update $(date -u +'%Y-%m-%d %H:%M')"
-          git pull --rebase --autostash origin ${GITHUB_REF_NAME}
-          git push
+          set -e
+          [ -s bracketboard.db ] || { echo "database missing or empty; refusing to upload"; exit 1; }
+          gh release upload "$DB_TAG" bracketboard.db --repo "$GITHUB_REPOSITORY" --clobber
+          echo "saved $(stat -c%s bracketboard.db) bytes"
