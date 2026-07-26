@@ -395,10 +395,21 @@ def realised_board(conn, window_days, brackets, bracket_of):
     except Exception:
         return ("no-data", {}, {})
 
-    active = [r[0] for r in conn.execute(
-        "SELECT coldkey FROM events WHERE substr(timestamp,1,10) >= ? "
-        "AND COALESCE(is_transfer,0)=0 AND action='SELL' AND price > 0 "
-        "GROUP BY coldkey", (target,))]
+    # Round trips only: parcels bought AND sold inside the window. A sale here
+    # of alpha bought in March is a real gain, but it is not something the
+    # wallet did in these days, and crediting the window with it is what makes
+    # a seven-day board meaningless - across the data only 32% of trades closed
+    # in a 7-day window were also opened in it.
+    try:
+        import trades as _trades
+        perf = _trades.window_performance(conn, target, round_trip_only=True)
+        held = {ck: (d or 0) for ck, d in conn.execute(
+            "SELECT coldkey, AVG(held_days) FROM closed_trade "
+            "WHERE sold_at >= ? AND bought_at >= ? GROUP BY coldkey",
+            (target, target))}
+    except Exception:
+        return ("no-data", {}, {})
+    active = list(perf)
 
     per_bracket = {label: [] for label, _, _ in brackets}
     exceptions = Counter()
@@ -413,13 +424,10 @@ def realised_board(conn, window_days, brackets, bracket_of):
         if not cov or cov > target:
             exceptions["trade history starts after the window"] += 1
             continue
-        trades = dashboard.realized_trades(conn, ck, target)
-        sells = [t for t in trades if t["pnl"] is not None and t["cost"]]
-        if not sells:
-            exceptions["no sale we can price"] += 1
+        banked, risked, nclosed = perf[ck]
+        if not nclosed:
+            exceptions["no round trip completed in the window"] += 1
             continue
-        banked = sum(t["pnl"] for t in sells)
-        risked = sum(t["cost"] for t in sells)
         if risked < MIN_RISKED_TAO:
             # A percentage off a fraction of a TAO is arithmetic, not skill:
             # +163% on 0.02 TAO risked is two pence and would top the board.
@@ -432,8 +440,9 @@ def realised_board(conn, window_days, brackets, bracket_of):
             continue
         per_bracket[label].append({
             "ck": ck, "realised": banked, "risked": risked,
-            "realised_pct": 100.0 * banked / risked, "sells": len(sells),
-            "v": v1, "subs": subs, "trades": len(trades), "target": target,
+            "realised_pct": 100.0 * banked / risked, "sells": nclosed,
+            "held": round(held.get(ck, 0), 1),
+            "v": v1, "subs": subs, "trades": nclosed, "target": target,
         })
 
     for label in per_bracket:

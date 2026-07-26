@@ -455,6 +455,11 @@ def main():
     # Qualify before rendering, never after: the page may only draw on records
     # that have already been corroborated against the market.
     try:
+        import trades
+        trades.rebuild(conn)
+    except Exception as e:
+        print("Trade matching failed ({}).".format(e))
+    try:
         import qualify
         qualify.qualify(conn)
     except Exception as e:

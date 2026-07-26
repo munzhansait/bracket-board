@@ -2,6 +2,11 @@ name: "Phase 1 - Sweep and Bracket"
 
 on:
   workflow_dispatch:
+    inputs:
+      calls:
+        description: "Max API calls this run (raise it to finish the crawl faster)"
+        required: false
+        default: "200"
   schedule:
     - cron: "17 0,6,12,18 * * *"   # four times a day (UTC)
 
@@ -18,7 +23,7 @@ env:
 jobs:
   sweep:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 330
     steps:
       - name: Get the code
         uses: actions/checkout@v4
@@ -50,7 +55,7 @@ jobs:
         env:
           TAOSTATS_API_KEY: ${{ secrets.TAOSTATS_API_KEY }}
           PACE_SECONDS: "1.1"          # Standard tier pace (60/min)
-          CALLS_PER_RUN: "200"         # 4 runs/day -> ~24k/month
+          CALLS_PER_RUN: ${{ inputs.calls || '200' }}
           MONTHLY_CEILING: "48000"     # shared pool cap; must match every workflow
           PYTHONUNBUFFERED: "1"
         run: python sweep.py

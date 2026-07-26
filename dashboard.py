@@ -198,6 +198,7 @@ def build_payload(conn, brackets, bracket_of, audited_board, windows):
                 trades = realized_trades(conn, r["ck"], r["target"], TRADES_SHOWN)
                 out.append({
                     "ck": r["ck"], "rp": round(r["realised_pct"], 2),
+                    "held": r.get("held", 0),
                     "realised": round(r["realised"], 3),
                     "risked": round(r["risked"], 2), "sells": r["sells"],
                     "v": round(r["v"], 2), "t": r["trades"],
@@ -544,7 +545,8 @@ function realisedTable(b){
     if(!rows.length){h+='<div class="empty">No wallet in this size range closed a trade we can price.</div>';continue;}
     h+=`<div class="scroll"><table><tr><th>#</th><th>Wallet</th>
       <th class="num">Return on closed trades</th><th class="num">Banked (TAO)</th>
-      <th class="num">Capital risked</th><th class="num">Sales</th>
+      <th class="num">Capital risked</th><th class="num">Round trips</th>
+      <th class="num">Avg hold</th>
       <th class="num">Holds now</th></tr>`;
     rows.forEach((r,i)=>{
       h+=`<tr class="w" data-ck="${r.ck}" data-i="${i}" data-label="${label}" data-mode="R">
@@ -553,18 +555,19 @@ function realisedTable(b){
         <td class="num ${r.rp>=0?'up':'down'}">${pct(r.rp)}</td>
         <td class="num ${r.realised>=0?'up':'down'}">${fmt(r.realised,3)}</td>
         <td class="num">${fmt(r.risked,2)}</td>
-        <td class="num">${r.sells}</td><td class="num">${fmt(r.v,2)}</td></tr>
-        <tr class="d" data-for="${r.ck}" style="display:none"><td colspan="7"></td></tr>`;
+        <td class="num">${r.sells}</td><td class="num">${r.held} d</td>
+        <td class="num">${fmt(r.v,2)}</td></tr>
+        <tr class="d" data-for="${r.ck}" style="display:none"><td colspan="8"></td></tr>`;
     });
     h+='</table></div>';
   }
   const x=b.rx||{}, keys=Object.keys(x).sort((a,c)=>x[c]-x[a]);
-  h=`<div class="explain"><b>Money actually taken off the table.</b> ${n} wallets sold
-    something at a profit or a loss in this period and the whole trade is priced: what
-    the alpha went out at, against the average price paid for it. The percentage is
-    measured against the capital those closed trades tied up, so it does not depend on
-    any balance figure - only on the trades themselves. Nothing here is a paper
-    gain.</div>` + h;
+  h=`<div class="explain"><b>Bought and sold inside these ${win}.</b> ${n} wallets
+    completed a full round trip in this period - the alpha was acquired here and sold
+    here, so the profit belongs to this window and not to a position held since March.
+    Each parcel is matched to the purchase that it closed, first in first out, and the
+    percentage is measured against what those parcels cost. It depends on no balance
+    figure, only on the trades. Nothing here is a paper gain.</div>` + h;
   if(keys.length){
     h+=`<div class="explain" style="border-left-color:var(--warn)">
       <b>Not shown here.</b> <ul class="sub" style="margin:.5rem 0 0;padding-left:1.1rem">
