@@ -67,7 +67,7 @@ def main():
           "  (hotkey={}, netuid={})".format(hotkey, netuid))
     hist = sweep.api_get(
         conn, "/api/dtao/stake_balance/history/v1?coldkey={}&hotkey={}"
-              "&netuid={}&limit={}&page=1".format(ck, hotkey, netuid, PAGE))
+              "&netuid={}&limit=100&page=1".format(ck, hotkey, netuid))
     ok &= show("history", hist)
 
     # The backfill reads these two fields; confirm they really exist.
@@ -80,6 +80,27 @@ def main():
                 print("    MISSING  backfill reads '{}' but it is not in the "
                       "response".format(field))
                 ok = False
+
+        # How many records land on the same calendar day? The backfill buckets
+        # by day, so more than one record per day means its running total is
+        # summing intraday snapshots of the SAME balance instead of picking one.
+        per_day = {}
+        for item in hist["data"]:
+            day = str(item.get("timestamp", ""))[:10]
+            per_day.setdefault(day, []).append(sweep.rao_to_tao(item.get("balance_as_tao")))
+        print("\n    records per calendar day (page 1):")
+        for day in sorted(per_day)[:6]:
+            vals = per_day[day]
+            print("      {}  {:3d} record(s)   summed={:.2f} TAO   latest={:.2f} TAO"
+                  .format(day, len(vals), sum(vals), vals[0]))
+        worst = max(len(v) for v in per_day.values())
+        if worst > 1:
+            print("\n    *** {} records share one day -> summing inflates that day "
+                  "by ~{}x. Must take one snapshot per day, not the sum. ***"
+                  .format(worst, worst))
+            ok = False
+        else:
+            print("\n    one record per day - safe to bucket by day.")
 
     print("\nCalls used: {}".format(sweep.calls_used_this_run))
     print("RESULT: {}".format("PASS" if ok else "FAIL"))
