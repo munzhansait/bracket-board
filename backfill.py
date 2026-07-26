@@ -16,13 +16,16 @@ tier it still works - just very slowly.
 """
 
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date, timedelta
 
 import sweep
 import collector as coll
 
 MIN_TAO = float(os.environ.get("BACKFILL_MIN_TAO", "1.0"))
-MAX_EVENT_PAGES = int(os.environ.get("BACKFILL_MAX_EVENT_PAGES", "5"))
+# Page back until we pass EVENT_DAYS; MAX_EVENT_PAGES is only a runaway guard
+# for wallets that trade constantly, not the normal stopping condition.
+EVENT_DAYS = int(os.environ.get("BACKFILL_EVENT_DAYS", "400"))
+MAX_EVENT_PAGES = int(os.environ.get("BACKFILL_MAX_EVENT_PAGES", "25"))
 MAX_HISTORY_PAGES = int(os.environ.get("BACKFILL_MAX_HISTORY_PAGES", "5"))
 PAGE_LIMIT = 200
 
@@ -44,20 +47,34 @@ def candidates(conn):
 
 
 def backfill_events(conn, ck):
+    """Pull this wallet's trade history back to EVENT_DAYS ago.
+
+    Paging stops on date, not on a blind page count: a fixed cap silently
+    truncated hyperactive wallets, and the missing deposits then read as
+    performance in the long-window return maths.
+    """
+    cutoff = (date.today() - timedelta(days=EVENT_DAYS)).isoformat()
     page = 1
     while page <= MAX_EVENT_PAGES:
         data = sweep.api_get(conn, "/api/delegation/v1?nominator={}&limit={}&page={}"
                              .format(ck, PAGE_LIMIT, page))
         if data is None:
             return False  # budget/errors - retry next run
-        for item in data.get("data", []):
+        items = data.get("data", [])
+        oldest = None
+        for item in items:
             ev = coll.parse_event(item)
             if not ev[2]:
                 ev = ev[:2] + (ck,) + ev[3:]  # nominator implied
             conn.execute(
                 "INSERT OR IGNORE INTO events(block_number,timestamp,coldkey,hotkey,"
-                "netuid,action,tao_amount,alpha_amount,price,watched) "
-                "VALUES(?,?,?,?,?,?,?,?,?,0)", ev)
+                "netuid,action,tao_amount,alpha_amount,price,is_transfer,watched) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,0)", ev)
+            day = str(ev[1])[:10]
+            if day and (oldest is None or day < oldest):
+                oldest = day
+        if oldest and oldest <= cutoff:
+            break  # reached far enough back; older trades cannot affect a window
         nxt = (data.get("pagination") or {}).get("next_page")
         if not nxt:
             break

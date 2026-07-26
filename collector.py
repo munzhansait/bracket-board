@@ -29,14 +29,21 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 WATCHLIST_PATH = os.path.join(HERE, "watchlist.txt")
 MAX_PAGES = 3
 PAGE_LIMIT = 200
-EVENT_RETENTION_DAYS = 45  # non-watchlist events pruned after this
+# Must outlive the longest leaderboard window (1 year), or the collector
+# deletes the deposit/withdrawal history the backfill paid to fetch and the
+# long-window return maths silently stops being flow-adjusted.
+EVENT_RETENTION_DAYS = int(os.environ.get("EVENT_RETENTION_DAYS", "400"))
 
 
 def ensure_tables(conn):
     conn.execute("""CREATE TABLE IF NOT EXISTS events(
         block_number INTEGER, timestamp TEXT, coldkey TEXT, hotkey TEXT,
         netuid INTEGER, action TEXT, tao_amount REAL, alpha_amount REAL,
-        price REAL, watched INTEGER DEFAULT 0)""")
+        price REAL, watched INTEGER DEFAULT 0, is_transfer INTEGER DEFAULT 0)""")
+    # Older databases predate is_transfer; add it rather than rebuilding.
+    cols = set(r[1] for r in conn.execute("PRAGMA table_info(events)"))
+    if "is_transfer" not in cols:
+        conn.execute("ALTER TABLE events ADD COLUMN is_transfer INTEGER DEFAULT 0")
     conn.execute("""CREATE UNIQUE INDEX IF NOT EXISTS ev_dedup ON events
         (block_number, coldkey, hotkey, netuid, action, tao_amount, timestamp)""")
     conn.execute("CREATE INDEX IF NOT EXISTS ev_cold ON events(coldkey)")
@@ -85,7 +92,11 @@ def parse_event(item):
         price = 0.0
     block = item.get("block_number") or 0
     ts = item.get("timestamp") or ""
-    return (block, ts, coldkey, hotkey, netuid, action, tao, alpha, price)
+    # Stake moved between wallets, not traded on a pool. It still moves value
+    # in or out of the portfolio, so it counts as a flow - but it is not a
+    # trading decision, so it must not count towards the skill filters.
+    transfer = 1 if item.get("is_transfer") else 0
+    return (block, ts, coldkey, hotkey, netuid, action, tao, alpha, price, transfer)
 
 
 def collect(conn, watchlist):
@@ -125,8 +136,8 @@ def collect(conn, watchlist):
         watched = 1 if ev[2] in watchlist else 0
         conn.execute(
             "INSERT OR IGNORE INTO events(block_number,timestamp,coldkey,hotkey,"
-            "netuid,action,tao_amount,alpha_amount,price,watched) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?)", ev + (watched,))
+            "netuid,action,tao_amount,alpha_amount,price,is_transfer,watched) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?)", ev + (watched,))
     if max_block > last_seen:
         sweep.meta_set(conn, "last_event_block", max_block)
     conn.execute(
@@ -146,7 +157,8 @@ def subnet_names(conn):
 
 def format_alert(events, names):
     lines = []
-    for block, ts, coldkey, hotkey, netuid, action, tao, alpha, price in events:
+    for (block, ts, coldkey, hotkey, netuid, action,
+         tao, alpha, price, transfer) in events:
         sn = names.get(netuid) or "SN{}".format(netuid)
         short = coldkey[:8] + "..." + coldkey[-4:] if len(coldkey) > 14 else coldkey
         lines.append(

@@ -35,19 +35,30 @@ WINDOWS = [
     ("1 year", 365),
 ]
 TOLERANCE_DAYS = 3       # snapshot may be up to this much older than target
+THINNED_AFTER_DAYS = 100  # beyond here snapshots are thinned to weekly...
+THINNED_TOLERANCE_DAYS = 8   # ...so allow a wider baseline window there
 MIN_BASELINE_TAO = 1.0
 TOP_N = 10
 MIN_SUBNETS = 2          # spread across subnets, OR...
 MIN_TRADES = 4           # ...more than 3 trades in the window
 
 
-def _snapshot_at_or_before(conn, day_iso):
-    """coldkey -> (day, total_tao): latest snapshot on/before day_iso."""
+def _snapshot_at_or_before(conn, day_iso, max_age_days):
+    """coldkey -> (day, total_tao): latest snapshot on/before day_iso, but no
+    older than max_age_days before it.
+
+    Without the lower bound a wallet with a gap in its history would have a
+    months-old balance used as its "30 days ago" value, turning ordinary
+    growth since then into a spectacular fake return.
+    """
+    floor_iso = (date.fromisoformat(day_iso)
+                 - timedelta(days=max_age_days)).isoformat()
     rows = conn.execute("""
         SELECT wd.coldkey, wd.day, wd.total_tao FROM wallet_daily wd
         JOIN (SELECT coldkey, MAX(day) AS d FROM wallet_daily
-              WHERE day <= ? GROUP BY coldkey) m
-          ON m.coldkey = wd.coldkey AND m.d = wd.day""", (day_iso,)).fetchall()
+              WHERE day <= ? AND day >= ? GROUP BY coldkey) m
+          ON m.coldkey = wd.coldkey AND m.d = wd.day""",
+        (day_iso, floor_iso)).fetchall()
     return {ck: (d, v) for ck, d, v in rows}
 
 
@@ -59,20 +70,53 @@ def _current_values(conn):
 
 def _flows_since(conn, day_iso):
     """coldkey -> (net_contribution_tao, trade_count) from events feed.
-    BUY adds external TAO into the tracked portfolio; SELL removes it."""
+
+    BUY adds external TAO into the tracked portfolio; SELL removes it. Both
+    count as flows, including stake transfers between wallets - value really
+    did move. Transfers are excluded from the trade count though, because
+    moving your own stake is not a trading decision and must not buy a wallet
+    a place on the board.
+    """
+    # The sweep renders this board but does not own the events schema, so on a
+    # database where the collector has not yet added is_transfer, count every
+    # event rather than failing the whole leaderboard.
+    have_flag = "is_transfer" in set(
+        r[1] for r in conn.execute("PRAGMA table_info(events)"))
+    trades_expr = ("SUM(CASE WHEN COALESCE(is_transfer,0)=0 THEN 1 ELSE 0 END)"
+                   if have_flag else "COUNT(*)")
     rows = conn.execute("""
         SELECT coldkey,
                SUM(CASE WHEN action='BUY' THEN tao_amount
                         WHEN action='SELL' THEN -tao_amount ELSE 0 END),
-               COUNT(*)
+               {}
         FROM events WHERE substr(timestamp,1,10) >= ?
-        GROUP BY coldkey""", (day_iso,)).fetchall()
-    return {ck: (c or 0.0, n) for ck, c, n in rows}
+        GROUP BY coldkey""".format(trades_expr), (day_iso,)).fetchall()
+    return {ck: (c or 0.0, n or 0) for ck, c, n in rows}
 
 
-def _events_coverage_start(conn):
-    row = conn.execute("SELECT MIN(substr(timestamp,1,10)) FROM events").fetchone()
-    return row[0] if row and row[0] else None
+def _events_coverage_by_wallet(conn):
+    """coldkey -> earliest event date held for that wallet.
+
+    Per wallet, not global: one wallet's deep history said nothing about
+    another's, so a wallet whose events only reach back a week was being
+    treated as fully flow-adjusted over a year.
+    """
+    return {ck: d for ck, d in conn.execute(
+        "SELECT coldkey, MIN(substr(timestamp,1,10)) FROM events GROUP BY coldkey")
+        if d}
+
+
+def sweep_pass_completed(conn):
+    """True once a full sweep pass has finished at least once.
+
+    Until then the holders table only covers the subnets crawled so far, so a
+    wallet's 'now' total omits its positions in subnets not yet reached.
+    """
+    row = conn.execute("SELECT value FROM meta WHERE key='generation'").fetchone()
+    try:
+        return bool(row) and int(row[0]) > 1
+    except (TypeError, ValueError):
+        return False
 
 
 def _owners(conn):
@@ -99,13 +143,17 @@ def compute_board(conn, window_days, brackets, bracket_of):
             return ("maturing:{}".format(max(days_more, 1)), {})
         target = target_date.isoformat()
 
-    baselines = _snapshot_at_or_before(conn, target)
+    # Snapshots older than ~100 days are thinned to one per week, so an exact
+    # 3-day tolerance would wrongly drop every wallet on the long windows.
+    age = (today - date.fromisoformat(target)).days
+    max_age = TOLERANCE_DAYS if age <= THINNED_AFTER_DAYS else THINNED_TOLERANCE_DAYS
+
+    baselines = _snapshot_at_or_before(conn, target, max_age)
     if len(baselines) < 2:
         return ("no-data", {})
     current = _current_values(conn)
     flows = _flows_since(conn, target)
-    cov_start = _events_coverage_start(conn)
-    flows_cover_window = bool(cov_start and cov_start <= target)
+    coverage = _events_coverage_by_wallet(conn)
     owners = _owners(conn)
 
     per_bracket = {label: [] for label, _, _ in brackets}
@@ -116,7 +164,15 @@ def compute_board(conn, window_days, brackets, bracket_of):
         contrib, trades = flows.get(ck, (0.0, 0))
         if subs < MIN_SUBNETS and trades < MIN_TRADES:
             continue
-        adjusted = flows_cover_window
+        # Only trust the flow adjustment if this wallet's own events reach
+        # back past the window start.
+        cov = coverage.get(ck)
+        adjusted = bool(cov and cov <= target)
+        if not adjusted and abs(contrib) > 0:
+            # Known flows inside the window but incomplete history before it:
+            # the raw number would read a deposit as performance. Drop it
+            # rather than publish a figure that flatters the wallet.
+            continue
         c = contrib if adjusted else 0.0
         denom = v0 + max(c, 0.0) / 2.0
         if denom <= 0:
@@ -144,6 +200,14 @@ def render_html(conn, brackets, bracket_of, esc):
              "run, so wallets that start losing drop off and newly discovered "
              "wallets appear as soon as they have enough history. Past performance "
              "is not a prediction. Not financial advice.</div>"]
+    if not sweep_pass_completed(conn):
+        parts.append(
+            "<div class='note' style='border:1px solid #b46;padding:.6em'>"
+            "<b>Provisional.</b> No full sweep pass has finished yet, so each "
+            "wallet's current value only counts the subnets crawled so far. "
+            "Returns below understate any wallet holding positions in subnets "
+            "not yet reached. Treat the ranking as indicative until this "
+            "notice disappears.</div>")
     for wname, wdays in WINDOWS:
         status, boards = compute_board(conn, wdays, brackets, bracket_of)
         parts.append("<h2>{}</h2>".format(esc(wname)))

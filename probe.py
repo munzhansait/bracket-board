@@ -66,10 +66,11 @@ def main():
     # Run the real parser over a real record. A field the feed does not use
     # silently parses to 0, which is how alpha and price stayed empty.
     if ev_data and ev_data.get("data"):
-        _b, _ts, _ck, _hk, netuid, action, tao, alpha, price = coll.parse_event(
-            ev_data["data"][0])
+        (_b, _ts, _ck, _hk, netuid, action, tao, alpha, price,
+         transfer) = coll.parse_event(ev_data["data"][0])
         print("    parsed -> action={} netuid={} tao={:.4f} alpha={:.4f} "
-              "price={:.6f}".format(action, netuid, tao, alpha, price))
+              "price={:.6f} is_transfer={}".format(
+                  action, netuid, tao, alpha, price, transfer))
         for name, val in (("tao_amount", tao), ("alpha_amount", alpha), ("price", price)):
             if not val:
                 print("    FAIL parse_event stored 0 for {} - field name mismatch"
