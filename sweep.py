@@ -343,7 +343,7 @@ def build_dashboard(conn):
             conn.execute("SELECT COUNT(DISTINCT day) FROM wallet_daily").fetchone()[0],
             ranked)
         html = dashboard.render(conn, BRACKETS, bracket_of,
-                                leaderboard.compute_board, leaderboard.WINDOWS, meta)
+                                leaderboard.audited_board, leaderboard.WINDOWS, meta)
         with open(os.path.join(DOCS_DIR, "index.html"), "w", encoding="utf-8") as f:
             f.write(html)
         print("Dashboard regenerated ({} KB).".format(len(html) // 1024))

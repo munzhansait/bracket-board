@@ -28,7 +28,7 @@ WINDOW_KEYS = ("7 days", "14 days", "30 days", "90 days")
 
 # ----------------------------- analytics ------------------------------
 
-def realized_trades(conn, coldkey, limit=TRADES_SHOWN):
+def realized_trades(conn, coldkey, since_iso=None, limit=None):
     """Trade-by-trade realised profit, using average cost per subnet.
 
     Alpha is bought and sold at a price in TAO, so a sale's profit is the
@@ -73,7 +73,9 @@ def realized_trades(conn, coldkey, limit=TRADES_SHOWN):
         book[netuid] = [held, max(cost, 0.0)]
         if transfer:
             continue                     # counted in the book, kept off the page
-        shown.append({
+        if since_iso and str(ts)[:10] < since_iso:
+            continue                     # cost basis built from before the window,
+        shown.append({                   # but only in-window trades are listed
             "t": str(ts)[:16].replace("T", " "),
             "n": netuid,
             "a": action,
@@ -85,7 +87,8 @@ def realized_trades(conn, coldkey, limit=TRADES_SHOWN):
             "pct": None if pct is None else round(pct, 2),
         })
 
-    shown = shown[-limit:]
+    if limit:
+        shown = shown[-limit:]
     running = 0.0
     for row in shown:                     # oldest first, so the total builds
         running += row["pnl"] or 0.0
@@ -114,36 +117,54 @@ def subnet_names(conn):
 
 # ------------------------------ payload -------------------------------
 
-def build_payload(conn, brackets, bracket_of, compute_board, windows):
+def build_payload(conn, brackets, bracket_of, audited_board, windows):
+    """One self-contained record per (window, wallet).
+
+    Everything shown for a window is computed for that window: its own value
+    series, its own trades, its own arithmetic. Nothing is carried over from a
+    different period, because a reader comparing a 14-day return against a
+    90-day trade list has been handed a contradiction.
+    """
     from datetime import date, timedelta
 
-    boards, featured = {}, {}
+    names = subnet_names(conn)
+    boards, wallets, subnets_used = {}, {}, set()
+
     for wname, wdays in windows:
         if wname not in WINDOW_KEYS:
             continue
-        status, per_bracket = compute_board(conn, wdays, brackets, bracket_of)
-        entry = {"status": status, "b": {}}
+        status, per_bracket, exceptions = audited_board(
+            conn, wdays, brackets, bracket_of)
+        entry = {"status": status, "b": {}, "x": exceptions,
+                 "days": wdays or 0}
         for label, _lo, _hi in brackets:
             rows = (per_bracket or {}).get(label, [])[:FEATURED_PER_BRACKET]
-            entry["b"][label] = [
-                {"ck": ck, "r": round(ret, 2), "pnl": round(pnl, 3),
-                 "v": round(v1, 2), "s": subs, "t": trades, "c": int(clean)}
-                for ck, ret, pnl, v1, subs, trades, clean in rows]
-            for row in rows:
-                featured[row[0]] = wdays or 90
+            out = []
+            for r in rows:
+                since = r["target"]
+                trades = realized_trades(conn, r["ck"], since)
+                realised = round(sum(t["pnl"] or 0.0 for t in trades), 4)
+                out.append({
+                    "ck": r["ck"], "r": round(r["ret"], 2),
+                    "v": round(r["v"], 2), "t": r["trades"],
+                    "start": round(r["start"], 3), "end": round(r["end"], 3),
+                    "sd": r["start_day"], "ed": r["end_day"],
+                    "bought": round(r["bought"], 3), "sold": round(r["sold"], 3),
+                    "moved": round(r["moved"], 3), "gain": round(r["gain"], 3),
+                    "realised": realised,
+                })
+                key = wname + "|" + r["ck"]
+                wallets[key] = {
+                    "s": value_series(conn, r["ck"], since),
+                    "tr": trades,
+                }
+                subnets_used.update(t["n"] for t in trades)
+            entry["b"][label] = out
         boards[wname] = entry
 
-    names = subnet_names(conn)
-    wallets = {}
-    for ck, wdays in featured.items():
-        since = (date.today() - timedelta(days=max(wdays, 90) + 5)).isoformat()
-        wallets[ck] = {
-            "s": value_series(conn, ck, since),
-            "tr": realized_trades(conn, ck),
-        }
-    used = sorted({t["n"] for w in wallets.values() for t in w["tr"]})
     return {"boards": boards, "wallets": wallets,
-            "names": {str(n): names.get(n, "SN{}".format(n)) for n in used}}
+            "names": {str(n): names.get(n, "SN{}".format(n))
+                      for n in sorted(subnets_used)}}
 
 
 # ------------------------------- page ---------------------------------
@@ -208,6 +229,11 @@ tr.w:hover{background:var(--chip)}
 .kpi div{background:var(--plane);border:1px solid var(--ring);border-radius:8px;padding:10px 12px}
 .kpi b{display:block;font-size:1.35rem;line-height:1.2}
 .kpi small{color:var(--muted);font-size:.76rem}
+table.bridge td{border-bottom:1px solid var(--grid);padding:6px 8px}
+table.bridge tr.gain td{border-top:2px solid var(--axis);border-bottom:2px solid var(--axis)}
+.pager{display:flex;align-items:center;gap:12px;margin:10px 0;flex-wrap:wrap}
+.pager button[disabled]{opacity:.4;cursor:default}
+.explain ul{line-height:1.7}
 a{color:var(--series);text-decoration:none}
 a:hover{text-decoration:underline}
 footer{margin-top:40px;color:var(--muted);font-size:.8rem;border-top:1px solid var(--grid);padding-top:14px}
@@ -278,79 +304,107 @@ function wireChart(el, series){
     tip.style.opacity=0;cross.setAttribute('opacity','0');dot.setAttribute('opacity','0');});
 }
 
-function tradeRows(tr){
-  if(!tr.length) return '<div class="empty">No buys or sells recorded.</div>';
-  let h=`<div class="scroll"><table><tr><th>When</th><th>Subnet</th><th>Action</th>
-    <th class="num">Alpha</th><th class="num">Price paid/got</th>
-    <th class="num">Avg cost held</th><th class="num">Profit on this sale</th>
-    <th class="num">Running total</th></tr>`;
-  for(const t of tr){
+const PAGE=15;
+function tradeRows(tr, ck, page){
+  if(!tr.length) return `<div class="explain" style="border-left-color:var(--warn)">
+    <b>No trades in this period.</b> This wallet bought and sold nothing over these
+    ${win}, so its whole gain is the alpha it already held changing in price. There is
+    no trade list to show because there were no trades - the table above the chart is
+    the complete account of where the number comes from.</div>`;
+  const pages=Math.ceil(tr.length/PAGE), p=Math.max(0,Math.min(page|0,pages-1));
+  const slice=tr.slice(p*PAGE,(p+1)*PAGE);
+  let h=`<div class="scroll"><table><tr><th>When</th><th>Subnet</th>
+    <th>What happened</th><th class="num">Result</th></tr>`;
+  for(const t of slice){
     const name=D.names[String(t.n)]||('SN'+t.n);
-    const buy=t.a==='BUY';
-    let profit='<span style="color:var(--muted)">— not sold yet</span>', avg='<span style="color:var(--muted)">—</span>';
-    if(t.pnl!==null&&t.pct!==null){
-      const c=t.pnl>=0?'up':'down';
-      profit=`<span class="${c}">${pct(t.pct)}</span><br><small style="color:var(--muted)">${fmt(t.pnl,3)} TAO</small>`;
-      avg=fmt(t.avg,5);
+    let story, result;
+    if(t.a==='BUY'){
+      story=`Bought <b>${fmt(t.al,2)}</b> alpha at <b>${fmt(t.p,5)}</b> TAO each`;
+      result='<span style="color:var(--muted)">still holding</span>';
+    } else if(t.pnl===null){
+      story=`Sold <b>${fmt(t.al,2)}</b> alpha`;
+      result='<span style="color:var(--muted)">no price recorded</span>';
+    } else {
+      const good=t.pnl>=0;
+      story=`Paid <b>${fmt(t.avg,5)}</b> each, sold <b>${fmt(t.al,2)}</b> at
+        <b>${fmt(t.p,5)}</b> each`;
+      result=`<span class="${good?'up':'down'}">${good?'Made':'Lost'}
+        ${fmt(Math.abs(t.pnl),3)} TAO</span><br>
+        <small style="color:var(--muted)">${good?'+':''}${fmt(t.pct,1)}% on this sale
+        &middot; running ${fmt(t.run,2)}</small>`;
     }
-    h+=`<tr><td class="mono">${t.t}</td><td>${name}</td>
-      <td>${buy?'bought':'sold'}</td>
-      <td class="num">${fmt(t.al,3)}</td>
-      <td class="num">${t.p?fmt(t.p,5):'—'}</td>
-      <td class="num">${avg}</td>
-      <td class="num">${profit}</td>
-      <td class="num ${t.run>=0?'up':'down'}">${fmt(t.run,3)}</td></tr>`;
+    h+=`<tr><td class="mono">${t.t}</td><td>${name}</td><td>${story}</td>
+      <td class="num">${result}</td></tr>`;
   }
-  return h+`</table></div>
-   <p class="sub">Each sale is priced against <b>Avg cost held</b> - the average
-   price paid for the alpha that wallet still held in that subnet at that moment.
-   Sell above it and the row is green. <b>Running total</b> adds the sales up in
-   order, so the last row equals the net figure above. Buys realise nothing, which
-   is why their profit column is empty. Transfers between wallets are left out
-   entirely, though they still count towards the alpha held.</p>`;
+  h+='</table></div>';
+  if(pages>1){
+    h+=`<div class="pager">
+      <button class="tab" data-pg="${p-1}" data-ck="${ck}" ${p===0?'disabled':''}>Previous</button>
+      <span class="sub">Showing ${p*PAGE+1}-${Math.min((p+1)*PAGE,tr.length)}
+        of ${tr.length} trades in this period</span>
+      <button class="tab" data-pg="${p+1}" data-ck="${ck}" ${p===pages-1?'disabled':''}>Next</button>
+    </div>`;
+  }
+  return h+`<p class="sub">Every buy and sell this wallet made in the selected
+   period - nothing is left out and nothing links away. A sale is a profit when it
+   went out for more than the average price paid for the alpha still held in that
+   subnet. Buys show no result because nothing is banked until something is sold.
+   Transfers between wallets are excluded: they are not trades, though they do
+   change how much alpha is held.</p>`;
 }
 
-/* Clip the history to the window being ranked, so the chart is the evidence
-   for the number above it rather than a different period entirely. */
-function windowSeries(series){
-  const days=parseInt(win,10); if(!days||!series.length) return series;
-  const end=new Date(series[series.length-1][0]+'T00:00:00Z');
-  const cut=new Date(end.getTime()-days*86400000).toISOString().slice(0,10);
-  const clipped=series.filter(p=>p[0]>=cut);
-  return clipped.length>1?clipped:series;
-}
-
-function detail(ck){
-  const w=D.wallets[ck]; if(!w) return '';
+function detail(ck, row, page){
+  const w=D.wallets[win+'|'+ck]; if(!w) return '';
   const wins=w.tr.filter(t=>t.pnl!==null&&t.pnl>0).length;
   const losses=w.tr.filter(t=>t.pnl!==null&&t.pnl<0).length;
-  const net=w.tr.reduce((a,t)=>a+(t.pnl||0),0);
   const rate=(wins+losses)?Math.round(100*wins/(wins+losses)):null;
-  const ser=windowSeries(w.s);
+  const unreal=row.gain-row.realised;
+  const money=n=>`${n>=0?'+':'−'}${fmt(Math.abs(n),3)}`;
   return `<div class="detail"><div class="grid2">
     <div>
-      <h3>What it held over the last ${win}</h3>
-      <div class="chartbox" data-ck="${ck}">${chart(ser,560,190)}</div>
+      <h3>What it held across these ${win}</h3>
+      <div class="chartbox" data-ck="${ck}">${chart(w.s,560,190)}</div>
       <div class="legend"><span><i class="swatch"></i>Total held in tracked subnets, in TAO</span></div>
-      <p class="sub">The <b>Return</b> above is the change in this line, ignoring money
-      paid in or taken out. The trades on the right are a different question - what it
-      banked when it actually sold. A wallet can be up here while selling badly, or
-      down here while every sale it made was profitable.</p>
     </div>
     <div>
-      <h3>What its sales actually banked</h3>
-      <div class="kpi">
-        <div><b>${rate===null?'—':rate+'%'}</b><small>sales made at a profit</small></div>
-        <div><b class="${net>=0?'up':'down'}">${fmt(net,2)}</b><small>net TAO banked</small></div>
-        <div><b>${wins}/${wins+losses}</b><small>profitable / total sales</small></div>
+      <h3>Where the ${pct(row.r)} comes from</h3>
+      <table class="bridge">
+        <tr><td>Held on ${row.sd}</td><td class="num">${fmt(row.start,3)} TAO</td></tr>
+        <tr><td>Spent buying alpha</td><td class="num">${money(row.bought)}</td></tr>
+        <tr><td>Received from selling</td><td class="num">${money(-row.sold)}</td></tr>
+        ${row.moved?`<tr><td>Moved in from other wallets</td><td class="num">${money(row.moved)}</td></tr>`:''}
+        <tr class="gain"><td><b>Gain in value</b></td>
+            <td class="num ${row.gain>=0?'up':'down'}"><b>${money(row.gain)} TAO</b></td></tr>
+        <tr><td>Held on ${row.ed}</td><td class="num">${fmt(row.end,3)} TAO</td></tr>
+      </table>
+      <p class="sub">Start, plus what went in, minus what came out, gives the end
+      balance. Anything left over is the gain - <b>${money(row.gain)} TAO</b>, which is
+      <b>${pct(row.r)}</b> of the money at work. That is subtraction, not a model.</p>
+      <div class="kpi" style="margin-top:12px">
+        <div><b class="${row.realised>=0?'up':'down'}">${money(row.realised)}</b>
+             <small>banked on sales</small></div>
+        <div><b class="${unreal>=0?'up':'down'}">${money(unreal)}</b>
+             <small>still on paper</small></div>
+        <div><b>${rate===null?'—':rate+'%'}</b><small>sales at a profit</small></div>
       </div>
-      <p class="sub" style="margin-top:10px">Worked out from the ${w.tr.length}
-      buys and sells listed below - add up the profit column and you get the
-      ${fmt(net,2)} TAO figure. Nothing here is an estimate.</p>
+      <p class="sub">The gain splits in two: <b>${money(row.realised)} TAO</b> actually
+      banked by selling - every one of those sales is listed below and they add up to
+      exactly that - and <b>${money(unreal)} TAO</b> that is only a paper gain on alpha
+      still held. Prices move, so the paper part can vanish.</p>
     </div></div>
-    <h3>Every buy and sell, oldest to newest at the bottom</h3>${tradeRows(w.tr)}
-    <p class="sub"><a href="https://taostats.io/account/${ck}" target="_blank"
-      rel="noopener">Open this wallet on taostats ↗</a></p></div>`;
+    <h3>Every trade in these ${win}</h3>${tradeRows(w.tr, ck, page||0)}</div>`;
+}
+
+function openDetail(host, ck, row, page){
+  const tr=host.querySelector(`tr.d[data-for="${ck}"]`);
+  tr.style.display='';
+  tr.firstElementChild.innerHTML=detail(ck,row,page);
+  const box=tr.querySelector('.chartbox');
+  if(box) wireChart(box, D.wallets[win+'|'+ck].s);
+  tr.querySelectorAll('button[data-pg]').forEach(b=>{
+    b.addEventListener('click',ev=>{ev.stopPropagation();
+      openDetail(host,ck,row,parseInt(b.dataset.pg,10));});
+  });
 }
 
 function board(){
@@ -359,38 +413,45 @@ function board(){
     host.innerHTML=`<div class="empty">${b?b.status:'No data'} - this window needs more history.</div>`;
     return;
   }
-  let h='';
+  let h='', total=0;
   for(const label of Object.keys(b.b)){
-    const rows=b.b[label];
+    const rows=b.b[label]; total+=rows.length;
     h+=`<h3>Wallets holding ${label} TAO</h3>`;
-    if(!rows.length){h+='<div class="empty">No wallet in this size range qualified.</div>';continue;}
+    if(!rows.length){h+='<div class="empty">No wallet in this size range passed every check.</div>';continue;}
     h+=`<div class="scroll"><table><tr><th>#</th><th>Wallet</th><th class="num">Return</th>
-      <th class="num">Profit (TAO)</th><th class="num">Holds now</th>
-      <th class="num">Trades</th><th></th></tr>`;
+      <th class="num">Gain (TAO)</th><th class="num">Banked</th>
+      <th class="num">Holds now</th><th class="num">Trades</th></tr>`;
     rows.forEach((r,i)=>{
-      h+=`<tr class="w" data-ck="${r.ck}"><td><span class="rank ${i===0?'top':''}">${i+1}</span></td>
+      h+=`<tr class="w" data-ck="${r.ck}" data-i="${i}" data-label="${label}">
+        <td><span class="rank ${i===0?'top':''}">${i+1}</span></td>
         <td class="mono">${short(r.ck)}</td>
         <td class="num ${r.r>=0?'up':'down'}">${pct(r.r)}</td>
-        <td class="num">${fmt(r.pnl,2)}</td><td class="num">${fmt(r.v,2)}</td>
-        <td class="num">${r.t}</td>
-        <td>${r.c?'':'<span class="flag" title="Some balance jumps could not be explained by recorded trades">gaps</span>'}</td></tr>
+        <td class="num">${fmt(r.gain,2)}</td>
+        <td class="num ${r.realised>=0?'up':'down'}">${fmt(r.realised,2)}</td>
+        <td class="num">${fmt(r.v,2)}</td><td class="num">${r.t}</td></tr>
         <tr class="d" data-for="${r.ck}" style="display:none"><td colspan="7"></td></tr>`;
     });
     h+='</table></div>';
   }
+  const x=b.x||{}, keys=Object.keys(x).sort((a,c)=>x[c]-x[a]);
+  if(keys.length){
+    h+=`<div class="explain" style="border-left-color:var(--warn)">
+      <b>What is deliberately missing.</b> ${total} wallets are shown. Others were
+      withheld because something about their data could not be verified for this
+      period - showing a number we cannot stand behind is worse than showing none:
+      <ul class="sub" style="margin:.5rem 0 0;padding-left:1.1rem">
+      ${keys.map(k=>`<li>${x[k]} — ${k}</li>`).join('')}</ul></div>`;
+  }
   host.innerHTML=h;
   host.querySelectorAll('tr.w').forEach(tr=>{
     tr.addEventListener('click',()=>{
-      const ck=tr.dataset.ck, row=host.querySelector(`tr.d[data-for="${ck}"]`);
-      const open=row.style.display!=='none';
+      const ck=tr.dataset.ck;
+      const row=D.boards[win].b[tr.dataset.label][parseInt(tr.dataset.i,10)];
+      const cur=host.querySelector(`tr.d[data-for="${ck}"]`);
+      const open=cur.style.display!=='none';
       host.querySelectorAll('tr.d').forEach(r=>{r.style.display='none';r.firstElementChild.innerHTML='';});
-      if(!open){
-        row.style.display='';
-        row.firstElementChild.innerHTML=detail(ck);
-        const box=row.querySelector('.chartbox');
-        if(box) wireChart(box, windowSeries(D.wallets[ck].s));
-        row.scrollIntoView({behavior:'smooth',block:'nearest'});
-      }
+      if(!open){ openDetail(host,ck,row,0);
+        cur.scrollIntoView({behavior:'smooth',block:'nearest'}); }
     });
   });
 }
@@ -405,8 +466,39 @@ board();
 """
 
 
-def render(conn, brackets, bracket_of, compute_board, windows, meta):
-    payload = build_payload(conn, brackets, bracket_of, compute_board, windows)
+def _self_check(payload):
+    """Refuse to publish a page whose own numbers do not agree.
+
+    The last line of defence: every figure shown is recomputed from the rows
+    behind it, and any mismatch raises rather than renders. A page that
+    quietly contradicts itself is the one failure mode there is no excuse for.
+    """
+    for wname, entry in payload["boards"].items():
+        for label, rows in entry.get("b", {}).items():
+            for r in rows:
+                key = wname + "|" + r["ck"]
+                trades = payload["wallets"][key]["tr"]
+                banked = round(sum(t["pnl"] or 0.0 for t in trades), 4)
+                if abs(banked - r["realised"]) > 1e-3:
+                    raise AssertionError(
+                        "{} {}: trades sum to {} but the row claims {}".format(
+                            wname, r["ck"][:10], banked, r["realised"]))
+                bridge = r["start"] + r["bought"] - r["sold"] + r["moved"] + r["gain"]
+                if abs(bridge - r["end"]) > 0.05:
+                    raise AssertionError(
+                        "{} {}: value bridge lands on {} not {}".format(
+                            wname, r["ck"][:10], round(bridge, 3), r["end"]))
+                if trades:
+                    run = trades[0]["run"]
+                    if abs(run - banked) > 1e-3:
+                        raise AssertionError(
+                            "{} {}: running total {} != banked {}".format(
+                                wname, r["ck"][:10], run, banked))
+
+
+def render(conn, brackets, bracket_of, audited_board, windows, meta):
+    payload = build_payload(conn, brackets, bracket_of, audited_board, windows)
+    _self_check(payload)
     blob = json.dumps(payload, separators=(",", ":")).replace("</", "<\\/")
 
     # Headline: the best qualifying wallet on the shortest mature window.
@@ -465,6 +557,15 @@ because their balance grows from running a subnet, not from picking one.</p>
 </div>
 
 {hero}
+
+<div class="explain" style="border-left-color:var(--warn)">
+<b>Known limitation, stated plainly.</b> The crawl has not yet visited every subnet, so
+a wallet is only ranked when every subnet it traded in is one we track - otherwise we
+would be reporting part of a portfolio as though it were the whole thing. That rule is
+what keeps the figures honest, but it has a side effect worth knowing: wallets that
+trade across many subnets are the most likely to be excluded, so the board currently
+leans towards quieter wallets. It corrects itself as the crawl completes.
+</div>
 
 <h2>The leaderboard</h2>
 <div class="tabs" role="tablist">{tabs}</div>

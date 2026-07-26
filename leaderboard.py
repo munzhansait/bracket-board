@@ -52,6 +52,10 @@ MAX_PNL_VS_PEAK = 3.0    # profit far beyond the largest balance ever held is
                          # arithmetically impossible without unseen deposits
 MIN_WINDOW_TAO = 1.0     # a wallet that emptied out mid-window is not ranked
 MAX_PLAUSIBLE_RETURN = 2000.0   # above this it is an artefact, not a trader
+MAX_GAP_DAYS = 2         # a hole in the daily history disqualifies the window
+MAX_FLOW_VS_START = 2.0  # more money moving than invested -> no honest return
+METHOD_TOLERANCE_PP = 2.0    # the two methods may differ by this many points...
+METHOD_TOLERANCE_REL = 0.10  # ...or this share of the figure, whichever is larger
 
 
 def _snapshot_at_or_before(conn, day_iso, max_age_days):
@@ -221,14 +225,136 @@ def time_weighted_return(series, flows, ck):
     return growth - 1.0, pnl, used, dropped
 
 
+def _traded_vs_tracked(conn, day_iso):
+    """coldkey -> subnets it traded in the window but that we do not track.
+
+    The daily value series only covers subnets present in holders. If a wallet
+    traded somewhere we do not track, its published return describes a fraction
+    of its portfolio while reading as the whole thing. That is the failure that
+    published a 3.71% week as +200.56%, so those wallets are not ranked at all.
+    """
+    tracked = {}
+    for ck, n in conn.execute("SELECT coldkey, netuid FROM holders"):
+        tracked.setdefault(ck, set()).add(n)
+    missing = {}
+    for ck, n in conn.execute(
+            "SELECT DISTINCT coldkey, netuid FROM events "
+            "WHERE substr(timestamp,1,10) >= ?", (day_iso,)):
+        if n not in tracked.get(ck, ()):
+            missing.setdefault(ck, set()).add(n)
+    return missing
+
+
+def _window_flows(conn, day_iso):
+    """coldkey -> (bought_tao, sold_tao, transferred_net_tao) inside the window.
+
+    Kept separate so the page can show a value bridge a reader can add up,
+    rather than a single net number they have to trust.
+    """
+    out = {}
+    for ck, action, transfer, total in conn.execute(
+            "SELECT e.coldkey, e.action, COALESCE(e.is_transfer,0), "
+            "SUM(e.tao_amount) FROM events e "
+            "WHERE substr(e.timestamp,1,10) >= ? AND " + TRACKED_SUBNET +
+            " GROUP BY e.coldkey, e.action, COALESCE(e.is_transfer,0)", (day_iso,)):
+        b, s, t = out.get(ck, (0.0, 0.0, 0.0))
+        amt = total or 0.0
+        if transfer:
+            t += amt if action == "BUY" else -amt
+        elif action == "BUY":
+            b += amt
+        elif action == "SELL":
+            s += amt
+        out[ck] = (b, s, t)
+    return out
+
+
+def audit(ck, series, per_day, flows_win, untracked, coverage, target,
+          owners, buyers, subs, trades):
+    """Every reason this wallet must not be published for this window.
+
+    Returns (reasons, record). An empty reason list is the only thing that
+    earns a place on the board. Publishing a wrong number is worse than
+    publishing nothing, so each check below suppresses rather than adjusts.
+    """
+    reasons = []
+    if ck in owners:
+        reasons.append("subnet owner")
+    if ck not in buyers:
+        reasons.append("never bought alpha")
+    if untracked:
+        reasons.append("traded in a subnet we do not track")
+    cov = coverage.get(ck)
+    if not cov or cov > target:
+        reasons.append("trade history starts after the window")
+    if len(series) < MIN_STEPS + 1:
+        return reasons + ["not enough daily snapshots"], None
+
+    values = [v for _d, v in series]
+    days = [date.fromisoformat(d) for d, _v in series]
+    if max((days[i] - days[i - 1]).days for i in range(1, len(days))) > MAX_GAP_DAYS:
+        reasons.append("gap in the daily history")
+    if min(values) < MIN_WINDOW_TAO:
+        reasons.append("wallet emptied out mid-window")
+
+    start, end = values[0], values[-1]
+    bought, sold, moved = flows_win.get(ck, (0.0, 0.0, 0.0))
+    net_in = bought - sold + moved
+    gain = end - start - net_in            # exact arithmetic, no modelling
+
+    # Two independent measures. The bridge above is plain subtraction; the
+    # chain below compounds daily moves. They answer the same question by
+    # different routes, so a disagreement means the inputs are inconsistent
+    # and neither number can be trusted.
+    twr_frac, _pnl, used, dropped = time_weighted_return(series, per_day, ck)
+    if dropped:
+        reasons.append("balance moved without a matching trade")
+    if used < MIN_STEPS:
+        reasons.append("too few usable days")
+
+    base = start + max(net_in, 0.0) / 2.0
+    if base <= 0:
+        return reasons + ["no capital at risk"], None
+    dietz_pct = 100.0 * gain / base
+    twr_pct = 100.0 * twr_frac
+
+    if abs(net_in) > MAX_FLOW_VS_START * start:
+        reasons.append("more money moved than was invested")
+    if abs(dietz_pct - twr_pct) > max(METHOD_TOLERANCE_PP,
+                                      abs(dietz_pct) * METHOD_TOLERANCE_REL):
+        reasons.append("two return methods disagree")
+    if abs(dietz_pct) > MAX_PLAUSIBLE_RETURN:
+        reasons.append("return outside any plausible range")
+    # Activity is deliberately NOT a gate. A quiet wallet's return is no less
+    # correct than a busy one's, and suppressing it would be withholding a true
+    # figure rather than a doubtful one. The trade count is published beside
+    # every row so a reader can weigh it themselves.
+
+    return reasons, {
+        "start": start, "end": end, "start_day": series[0][0],
+        "end_day": series[-1][0], "bought": bought, "sold": sold,
+        "moved": moved, "gain": gain, "ret": dietz_pct, "twr": twr_pct,
+    }
+
+
 def compute_board(conn, window_days, brackets, bracket_of):
-    """Returns (status, per_bracket) where per_bracket maps label -> rows.
-    Row: (coldkey, ret_pct, pnl_tao, value_now, subnets, trades, adjusted)"""
+    status, per_bracket, _ex = audited_board(conn, window_days, brackets, bracket_of)
+    return status, per_bracket
+
+
+def audited_board(conn, window_days, brackets, bracket_of):
+    """Returns (status, per_bracket, exceptions).
+
+    per_bracket maps label -> list of records that passed every check.
+    exceptions counts why the rest were withheld, so the page can say what it
+    is not showing instead of quietly dropping wallets.
+    """
+    from collections import Counter
     today = date.today()
     first_row = conn.execute("SELECT MIN(day) FROM wallet_daily").fetchone()
     first_day = first_row[0] if first_row else None
     if not first_day:
-        return ("no-data", {})
+        return ("no-data", {}, {})
 
     if window_days is None:
         target = first_day
@@ -237,7 +363,7 @@ def compute_board(conn, window_days, brackets, bracket_of):
         if date.fromisoformat(first_day) > target_date + timedelta(days=TOLERANCE_DAYS):
             days_more = (date.fromisoformat(first_day)
                          + timedelta(days=window_days) - today).days
-            return ("maturing:{}".format(max(days_more, 1)), {})
+            return ("maturing:{}".format(max(days_more, 1)), {}, {})
         target = target_date.isoformat()
 
     # Snapshots older than ~100 days are thinned to one per week, so an exact
@@ -247,58 +373,44 @@ def compute_board(conn, window_days, brackets, bracket_of):
 
     baselines = _snapshot_at_or_before(conn, target, max_age)
     if len(baselines) < 2:
-        return ("no-data", {})
+        return ("no-data", {}, {})
     current = _current_values(conn)
     flows = _flows_since(conn, target)
     series_all = _daily_series(conn, target)
     per_day = _flows_by_day(conn, target)
+    flows_win = _window_flows(conn, target)
+    untracked = _traded_vs_tracked(conn, target)
+    coverage = _events_coverage_by_wallet(conn)
     owners = _owners(conn)
     buyers = _alpha_buyers(conn)
 
     per_bracket = {label: [] for label, _, _ in brackets}
-    for ck, (bday, v0) in baselines.items():
-        if ck in owners or v0 < MIN_BASELINE_TAO:
+    exceptions = Counter()
+    for ck, (_bday, v0) in baselines.items():
+        if v0 < MIN_BASELINE_TAO:
+            exceptions["too small to rank"] += 1
             continue
-        if ck not in buyers:
-            continue  # never bought alpha - operator or emission recipient
         v1, subs = current.get(ck, (0.0, 0))
         _contrib, trades = flows.get(ck, (0.0, 0))
-        if subs < MIN_SUBNETS and trades < MIN_TRADES:
+        reasons, rec = audit(ck, series_all.get(ck) or [], per_day, flows_win,
+                             untracked.get(ck), coverage, target, owners,
+                             buyers, subs, trades)
+        if reasons or not rec:
+            for r in reasons:
+                exceptions[r] += 1
             continue
-        series = series_all.get(ck) or []
-        if len(series) < MIN_STEPS + 1:
-            continue  # too few snapshots in this window to chain a return
-        ret_frac, pnl, used, dropped = time_weighted_return(series, per_day, ck)
-        if used < MIN_STEPS:
-            continue
-        # A wallet whose series is mostly unexplained jumps is being driven by
-        # transfers we cannot see; ranking it would be guesswork.
-        if dropped > used * MAX_DROPPED_SHARE:
-            continue
-        # Coherence check. Chained percentages can compound into fantasy while
-        # the wallet stays small - one 36 TAO wallet came out at +71370% with a
-        # claimed profit of 865 TAO. You cannot earn many times the largest
-        # balance you ever held unless money arrived that we never saw.
-        values = [v for _d, v in series]
-        peak = max(values)
-        if peak <= 0 or abs(pnl) > MAX_PNL_VS_PEAK * peak:
-            continue
-        # A wallet that emptied out and re-entered has no meaningful percentage
-        # for the window: chaining growth off a near-zero base compounded one
-        # of these to +4,293,349%. Rank only wallets that stayed invested.
-        if min(values) < MIN_WINDOW_TAO:
-            continue
-        ret_pct = 100.0 * ret_frac
-        if abs(ret_pct) > MAX_PLAUSIBLE_RETURN:
-            continue  # backstop: no real wallet, only undetected flows
         label = bracket_of(v1 if v1 > 0 else v0)
-        if label:
-            per_bracket[label].append(
-                (ck, ret_pct, pnl, v1, subs, trades, dropped == 0))
+        if not label:
+            exceptions["outside every size bracket"] += 1
+            continue
+        rec.update({"ck": ck, "v": v1, "subs": subs, "trades": trades,
+                    "target": target})
+        per_bracket[label].append(rec)
 
     for label in per_bracket:
-        per_bracket[label] = sorted(per_bracket[label], key=lambda r: -r[1])[:TOP_N]
-    return ("ok", per_bracket)
+        per_bracket[label] = sorted(
+            per_bracket[label], key=lambda r: -r["ret"])[:TOP_N]
+    return ("ok", per_bracket, dict(exceptions))
 
 
 def render_html(conn, brackets, bracket_of, esc):
@@ -341,6 +453,8 @@ def render_html(conn, brackets, bracket_of, esc):
             any_rows = True
             parts.append("<h3 style='font-size:.95em;color:#c9a9e8;margin:1em 0 0'>"
                          "Bracket {} TAO</h3>".format(label))
+            rows = [(r["ck"], r["ret"], r["gain"], r["v"], r["subs"],
+                     r["trades"], True) for r in rows]
             parts.append("<table><tr><th>#</th><th>Wallet</th><th class='num'>Return</th>"
                          "<th class='num'>P&amp;L (TAO)</th><th class='num'>Now (TAO)</th>"
                          "<th class='num'>Subnets</th><th class='num'>Trades</th>"
