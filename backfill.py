@@ -26,6 +26,7 @@ MIN_TAO = float(os.environ.get("BACKFILL_MIN_TAO", "1.0"))
 # for wallets that trade constantly, not the normal stopping condition.
 EVENT_DAYS = int(os.environ.get("BACKFILL_EVENT_DAYS", "400"))
 MAX_EVENT_PAGES = int(os.environ.get("BACKFILL_MAX_EVENT_PAGES", "25"))
+MAX_WALLETS = int(os.environ.get("BACKFILL_MAX_WALLETS", "0"))  # 0 = no limit
 MAX_HISTORY_PAGES = int(os.environ.get("BACKFILL_MAX_HISTORY_PAGES", "5"))
 PAGE_LIMIT = 200
 
@@ -167,9 +168,15 @@ def main():
     todo = candidates(conn)
     print("Backfill candidates remaining: {}".format(len(todo)))
     processed = 0
+    attempted = 0
     for ck in todo:
         if sweep.calls_used_this_run >= sweep.CALLS_PER_RUN or sweep.budget_left(conn) <= 0:
             break
+        if MAX_WALLETS and attempted >= MAX_WALLETS:
+            print("Stopping: wallet limit ({}) reached.".format(MAX_WALLETS))
+            break
+        attempted += 1
+        print("[{}] {}".format(attempted, ck))
         row = conn.execute(
             "SELECT events_done, history_done FROM backfill_done WHERE coldkey=?",
             (ck,)).fetchone() or (0, 0)
