@@ -1,0 +1,36 @@
+name: "Backfill - paid month burst"
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sweep
+  cancel-in-progress: false
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Run backfill
+        env:
+          TAOSTATS_API_KEY: ${{ secrets.TAOSTATS_API_KEY }}
+          PACE_SECONDS: "1.1"          # Standard tier pace (60/min)
+          CALLS_PER_RUN: "15000"       # per 6h run
+          MONTHLY_CEILING: "48000"     # Standard tier: 50k/month
+        run: python backfill.py
+      - name: Save results
+        run: |
+          git config user.name "bracket-board-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add bracketboard.db docs/index.html
+          git diff --cached --quiet || git commit -m "Backfill $(date -u +'%Y-%m-%d %H:%M')"
+          git pull --rebase origin ${GITHUB_REF_NAME} || true
+          git push

@@ -33,7 +33,7 @@ DOCS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "docs")
 
 CALLS_PER_RUN = int(os.environ.get("CALLS_PER_RUN", "40"))
 MONTHLY_CEILING = int(os.environ.get("MONTHLY_CEILING", "9000"))
-PAUSE_SECONDS = 13.2
+PAUSE_SECONDS = float(os.environ.get("PACE_SECONDS", "13.2"))
 PAGE_SIZE = 200
 DUST_TAO = 0.05          # ignore positions below this (TAO) to keep DB small
 RAO = 1_000_000_000      # 1 TAO = 1e9 rao
@@ -386,6 +386,15 @@ def build_dashboard(conn):
                 "<td class='num'>{:.2f}</td><td class='num'>{}</td></tr>".format(
                     i, esc(ck), esc(ck[:10] + "..." + ck[-6:]), tag, total or 0, subs))
         parts.append("</table>")
+
+    try:
+        import leaderboard
+        parts.append(leaderboard.render_html(
+            conn, BRACKETS, bracket_of, esc))
+    except Exception as e:
+        parts.append("<div class='meta'>Leaderboards unavailable this run: {}</div>"
+                     .format(esc(str(e))))
+
     parts.append("</div></body></html>")
     with open(os.path.join(DOCS_DIR, "index.html"), "w", encoding="utf-8") as f:
         f.write("".join(parts))
