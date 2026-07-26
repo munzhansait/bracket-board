@@ -2,6 +2,11 @@ name: "Backfill - paid month burst"
 
 on:
   workflow_dispatch:
+    inputs:
+      calls:
+        description: "Max API calls this run (use a small number to smoke-test)"
+        required: false
+        default: "15000"
 
 permissions:
   contents: write
@@ -23,7 +28,7 @@ jobs:
         env:
           TAOSTATS_API_KEY: ${{ secrets.TAOSTATS_API_KEY }}
           PACE_SECONDS: "1.1"          # Standard tier pace (60/min)
-          CALLS_PER_RUN: "15000"       # per 6h run
+          CALLS_PER_RUN: ${{ inputs.calls || '15000' }}
           MONTHLY_CEILING: "48000"     # Standard tier: 50k/month
           PYTHONUNBUFFERED: "1"        # stream the log live; don't block-buffer
         run: python backfill.py
