@@ -12,6 +12,9 @@ Windows mature automatically as history accumulates; immature windows
 show a countdown instead of misleading numbers.
 
 Skill filters applied to every board:
+  - alpha buyers only: a wallet that never bought alpha is a miner,
+    validator or emission recipient, not an investor
+  - root network (netuid 0) ignored: no alpha exposure, no dTAO risk
   - subnet owners excluded (operators, not investors)
   - baseline portfolio >= 1 TAO
   - activity requirement: position in >= 2 subnets OR more than 3 trades
@@ -63,9 +66,26 @@ def _snapshot_at_or_before(conn, day_iso, max_age_days):
 
 
 def _current_values(conn):
+    """Alpha positions only. netuid 0 is the root network: staking there
+    carries no alpha exchange-rate risk and is not dTAO investing, so it
+    must not count towards an investor's portfolio or subnet spread."""
     return {ck: (v or 0.0, subs) for ck, v, subs in conn.execute(
         "SELECT coldkey, SUM(balance_tao), COUNT(DISTINCT netuid) "
-        "FROM holders GROUP BY coldkey")}
+        "FROM holders WHERE netuid != 0 GROUP BY coldkey")}
+
+
+def _alpha_buyers(conn):
+    """Coldkeys that have actually bought alpha at least once.
+
+    Miners and validators accumulate alpha from emissions without ever
+    buying any. Their balance growth measures operating a subnet, not
+    investing in one, so they must not be ranked against investors. A
+    wallet that never appears as a buyer is not a dTAO investor, whatever
+    its balance says.
+    """
+    return {ck for (ck,) in conn.execute(
+        "SELECT DISTINCT coldkey FROM events "
+        "WHERE action='BUY' AND COALESCE(is_transfer,0)=0")}
 
 
 def _flows_since(conn, day_iso):
@@ -155,11 +175,14 @@ def compute_board(conn, window_days, brackets, bracket_of):
     flows = _flows_since(conn, target)
     coverage = _events_coverage_by_wallet(conn)
     owners = _owners(conn)
+    buyers = _alpha_buyers(conn)
 
     per_bracket = {label: [] for label, _, _ in brackets}
     for ck, (bday, v0) in baselines.items():
         if ck in owners or v0 < MIN_BASELINE_TAO:
             continue
+        if ck not in buyers:
+            continue  # never bought alpha - operator or emission recipient
         v1, subs = current.get(ck, (0.0, 0))
         contrib, trades = flows.get(ck, (0.0, 0))
         if subs < MIN_SUBNETS and trades < MIN_TRADES:
@@ -195,7 +218,10 @@ def render_html(conn, brackets, bracket_of, esc):
              "<div class='note'>Percentage return per wallet, ranked within size "
              "brackets. Adjusted for deposits/withdrawals where the event feed covers "
              "the window (&#10003; in Adj column); otherwise raw balance change. "
-             "Skill filters: subnet owners excluded, baseline &ge; 1 TAO, and "
+             "Only wallets that have actually bought alpha are ranked - miners, "
+             "validators and subnet owners accumulate alpha from emissions "
+             "rather than investing, and root-network stake is ignored entirely. "
+             "Further filters: baseline &ge; 1 TAO, and "
              "&ge;2 subnets or &gt;3 trades required. Rebuilt from scratch every "
              "run, so wallets that start losing drop off and newly discovered "
              "wallets appear as soon as they have enough history. Past performance "
