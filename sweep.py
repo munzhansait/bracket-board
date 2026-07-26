@@ -452,6 +452,14 @@ def main():
         return
     if refresh_subnets(conn):
         continue_sweep(conn)
+    # Qualify before rendering, never after: the page may only draw on records
+    # that have already been corroborated against the market.
+    try:
+        import qualify
+        qualify.qualify(conn)
+    except Exception as e:
+        print("Qualification engine failed ({}); the board will fall back to "
+              "its own checks.".format(e))
     build_dashboard(conn)
     conn.commit()
     conn.close()

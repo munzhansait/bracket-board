@@ -106,8 +106,15 @@ def _alpha_buyers(conn):
 # portfolio: one wallet showed 25.9 TAO of net sales against a 39 TAO balance
 # that never moved, and the chain read +200% for a week that gained 3.7%.
 # Every flow query is therefore restricted to the subnets we actually track.
+# Matched on hotkey as well as subnet. A wallet moving stake from one validator
+# to another writes a sell on the old hotkey and a buy on the new one; if only
+# the new hotkey is tracked, the sell never touches our balance while the buy
+# adds to it. Keyed on subnet alone the pair netted to zero, so a 1.005 TAO
+# validator switch read as a 15% day and published an 8 TAO wallet at +18.56%
+# when its subnet had moved 3.97%. Balances are per position, so flows must be.
 TRACKED_SUBNET = ("EXISTS (SELECT 1 FROM holders h "
-                  "WHERE h.coldkey = e.coldkey AND h.netuid = e.netuid)")
+                  "WHERE h.coldkey = e.coldkey AND h.netuid = e.netuid "
+                  "AND h.hotkey = e.hotkey)")
 
 
 def _flows_since(conn, day_iso):
@@ -234,14 +241,14 @@ def _traded_vs_tracked(conn, day_iso):
     published a 3.71% week as +200.56%, so those wallets are not ranked at all.
     """
     tracked = {}
-    for ck, n in conn.execute("SELECT coldkey, netuid FROM holders"):
-        tracked.setdefault(ck, set()).add(n)
+    for ck, n, hk in conn.execute("SELECT coldkey, netuid, hotkey FROM holders"):
+        tracked.setdefault(ck, set()).add((n, hk))
     missing = {}
-    for ck, n in conn.execute(
-            "SELECT DISTINCT coldkey, netuid FROM events "
+    for ck, n, hk in conn.execute(
+            "SELECT DISTINCT coldkey, netuid, hotkey FROM events "
             "WHERE substr(timestamp,1,10) >= ?", (day_iso,)):
-        if n not in tracked.get(ck, ()):
-            missing.setdefault(ck, set()).add(n)
+        if (n, hk) not in tracked.get(ck, ()):
+            missing.setdefault(ck, set()).add((n, hk))
     return missing
 
 
@@ -270,7 +277,7 @@ def _window_flows(conn, day_iso):
 
 
 def audit(ck, series, per_day, flows_win, untracked, coverage, target,
-          owners, buyers, subs, trades):
+          owners, buyers, subs, trades, qualified=None):
     """Every reason this wallet must not be published for this window.
 
     Returns (reasons, record). An empty reason list is the only thing that
@@ -278,12 +285,17 @@ def audit(ck, series, per_day, flows_win, untracked, coverage, target,
     publishing nothing, so each check below suppresses rather than adjusts.
     """
     reasons = []
+    # The qualification engine's verdict comes first: it corroborates each
+    # wallet's balance against what its subnet actually traded at, which is
+    # the only check here that uses evidence from outside the wallet itself.
+    if qualified is not None and ck not in qualified:
+        reasons.append("balance does not match the market price of what it holds")
     if ck in owners:
         reasons.append("subnet owner")
     if ck not in buyers:
         reasons.append("never bought alpha")
     if untracked:
-        reasons.append("traded in a subnet we do not track")
+        reasons.append("traded in a position we do not track")
     cov = coverage.get(ck)
     if not cov or cov > target:
         reasons.append("trade history starts after the window")
@@ -383,6 +395,11 @@ def audited_board(conn, window_days, brackets, bracket_of):
     coverage = _events_coverage_by_wallet(conn)
     owners = _owners(conn)
     buyers = _alpha_buyers(conn)
+    try:
+        import qualify
+        qualified = qualify.good_wallets(conn)
+    except Exception:
+        qualified = None      # engine unavailable: fall back to local checks
 
     per_bracket = {label: [] for label, _, _ in brackets}
     exceptions = Counter()
@@ -394,7 +411,7 @@ def audited_board(conn, window_days, brackets, bracket_of):
         _contrib, trades = flows.get(ck, (0.0, 0))
         reasons, rec = audit(ck, series_all.get(ck) or [], per_day, flows_win,
                              untracked.get(ck), coverage, target, owners,
-                             buyers, subs, trades)
+                             buyers, subs, trades, qualified)
         if reasons or not rec:
             for r in reasons:
                 exceptions[r] += 1
