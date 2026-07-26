@@ -71,11 +71,25 @@ def main():
         print("    parsed -> action={} netuid={} tao={:.4f} alpha={:.4f} "
               "price={:.6f} is_transfer={}".format(
                   action, netuid, tao, alpha, price, transfer))
-        for name, val in (("tao_amount", tao), ("alpha_amount", alpha), ("price", price)):
-            if not val:
-                print("    FAIL parse_event stored 0 for {} - field name mismatch"
-                      .format(name))
+        # Compare against the raw record. A zero is only a bug when the feed
+        # actually carried a value; some events genuinely report zero - a
+        # subnet liquidation, for instance, has amount and price of "0".
+        raw = ev_data["data"][0]
+        for name, parsed, rawval in (
+                ("tao_amount", tao, raw.get("tao_amount") or raw.get("amount")),
+                ("alpha_amount", alpha, raw.get("alpha_amount") or raw.get("alpha")),
+                ("price", price, raw.get("rate") or raw.get("alpha_price_in_tao"))):
+            try:
+                rawnum = float(rawval or 0)
+            except (TypeError, ValueError):
+                rawnum = 0.0
+            if rawnum and not parsed:
+                print("    FAIL {} is {!r} in the feed but parsed to 0 - field "
+                      "name mismatch".format(name, rawval))
                 ok = False
+            elif not rawnum:
+                print("    note: feed itself reports {} as 0 on this record"
+                      .format(name))
         if tao and alpha and price:
             drift = abs(alpha * price - tao) / tao
             print("    cross-check: alpha*price={:.4f} vs tao={:.4f}  (drift {:.2%})"
