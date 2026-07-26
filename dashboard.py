@@ -22,7 +22,7 @@ from datetime import datetime, timezone
 
 FEATURED_PER_BRACKET = 6      # rows kept per bracket per window
 SERIES_POINTS = 90            # downsample each wallet's value history to this
-TRADES_SHOWN = 20             # most recent trades per wallet
+TRADES_SHOWN = 30             # most recent buys/sells per wallet (transfers excluded)
 WINDOW_KEYS = ("7 days", "14 days", "30 days", "90 days")
 
 
@@ -33,10 +33,18 @@ def realized_trades(conn, coldkey, limit=TRADES_SHOWN):
 
     Alpha is bought and sold at a price in TAO, so a sale's profit is the
     alpha sold times the gap between its sale price and the average price
-    paid for the alpha still held in that subnet. Events with no price -
-    subnet liquidations report zero - move inventory but realise nothing,
-    and are returned with pnl None so the page can show them honestly
-    rather than as a 100% loss.
+    paid for the alpha still held in that subnet. Each returned sale carries
+    the average cost it was measured against and a running total, so the
+    summary figures can be checked row by row rather than taken on trust.
+
+    Transfers are walked but never returned. Stake moving between wallets is
+    not a trading decision and clutters the record, yet it genuinely changes
+    the alpha held - ignoring it entirely would credit a later sale with
+    profit on alpha that was never bought.
+
+    Events with no price - subnet liquidations report zero - move inventory
+    but realise nothing, and come back with pnl None rather than as a 100%
+    loss.
     """
     rows = conn.execute(
         "SELECT timestamp, netuid, action, tao_amount, alpha_amount, price, "
@@ -44,10 +52,10 @@ def realized_trades(conn, coldkey, limit=TRADES_SHOWN):
         "ORDER BY timestamp", (coldkey,)).fetchall()
 
     book = {}          # netuid -> [alpha_held, tao_cost]
-    out = []
+    shown = []
     for ts, netuid, action, tao, alpha, price, transfer in rows:
         held, cost = book.get(netuid, [0.0, 0.0])
-        pnl = pct = None
+        pnl = pct = avg_used = None
         if action == "BUY" and alpha:
             held += alpha
             cost += tao if tao else alpha * (price or 0.0)
@@ -57,22 +65,32 @@ def realized_trades(conn, coldkey, limit=TRADES_SHOWN):
                 sold = min(alpha, held)
                 pnl = (price - avg) * sold
                 pct = ((price / avg) - 1.0) * 100.0 if avg > 0 else None
+                avg_used = avg
                 cost -= avg * sold
                 held -= sold
             else:
                 held = max(held - alpha, 0.0)
         book[netuid] = [held, max(cost, 0.0)]
-        out.append({
+        if transfer:
+            continue                     # counted in the book, kept off the page
+        shown.append({
             "t": str(ts)[:16].replace("T", " "),
             "n": netuid,
             "a": action,
             "tao": round(tao or 0.0, 4),
+            "al": round(alpha or 0.0, 4),
             "p": round(price or 0.0, 6),
+            "avg": None if avg_used is None else round(avg_used, 6),
             "pnl": None if pnl is None else round(pnl, 4),
             "pct": None if pct is None else round(pct, 2),
-            "x": int(transfer),
         })
-    return out[-limit:][::-1]      # newest first
+
+    shown = shown[-limit:]
+    running = 0.0
+    for row in shown:                     # oldest first, so the total builds
+        running += row["pnl"] or 0.0
+        row["run"] = round(running, 4)
+    return shown[::-1]                    # newest first for reading
 
 
 def value_series(conn, coldkey, since_iso, points=SERIES_POINTS):
@@ -261,22 +279,35 @@ function wireChart(el, series){
 }
 
 function tradeRows(tr){
-  if(!tr.length) return '<div class="empty">No trades recorded in the window.</div>';
+  if(!tr.length) return '<div class="empty">No buys or sells recorded.</div>';
   let h=`<div class="scroll"><table><tr><th>When</th><th>Subnet</th><th>Action</th>
-    <th class="num">Size (TAO)</th><th class="num">Price</th><th class="num">Profit</th></tr>`;
+    <th class="num">Alpha</th><th class="num">Price paid/got</th>
+    <th class="num">Avg cost held</th><th class="num">Profit on this sale</th>
+    <th class="num">Running total</th></tr>`;
   for(const t of tr){
     const name=D.names[String(t.n)]||('SN'+t.n);
-    const act=t.x?'transfer':(t.a==='BUY'?'bought':'sold');
-    let profit='<span style="color:var(--muted)">-</span>';
+    const buy=t.a==='BUY';
+    let profit='<span style="color:var(--muted)">— not sold yet</span>', avg='<span style="color:var(--muted)">—</span>';
     if(t.pnl!==null&&t.pct!==null){
       const c=t.pnl>=0?'up':'down';
       profit=`<span class="${c}">${pct(t.pct)}</span><br><small style="color:var(--muted)">${fmt(t.pnl,3)} TAO</small>`;
+      avg=fmt(t.avg,5);
     }
-    h+=`<tr><td class="mono">${t.t}</td><td>${name}</td><td>${act}</td>
-      <td class="num">${fmt(t.tao,3)}</td><td class="num">${t.p?fmt(t.p,5):'-'}</td>
-      <td class="num">${profit}</td></tr>`;
+    h+=`<tr><td class="mono">${t.t}</td><td>${name}</td>
+      <td>${buy?'bought':'sold'}</td>
+      <td class="num">${fmt(t.al,3)}</td>
+      <td class="num">${t.p?fmt(t.p,5):'—'}</td>
+      <td class="num">${avg}</td>
+      <td class="num">${profit}</td>
+      <td class="num ${t.run>=0?'up':'down'}">${fmt(t.run,3)}</td></tr>`;
   }
-  return h+'</table></div>';
+  return h+`</table></div>
+   <p class="sub">Each sale is priced against <b>Avg cost held</b> - the average
+   price paid for the alpha that wallet still held in that subnet at that moment.
+   Sell above it and the row is green. <b>Running total</b> adds the sales up in
+   order, so the last row equals the net figure above. Buys realise nothing, which
+   is why their profit column is empty. Transfers between wallets are left out
+   entirely, though they still count towards the alpha held.</p>`;
 }
 
 /* Clip the history to the window being ranked, so the chart is the evidence
@@ -307,16 +338,17 @@ function detail(ck){
       down here while every sale it made was profitable.</p>
     </div>
     <div>
-      <h3>Recent trades at a glance</h3>
+      <h3>What its sales actually banked</h3>
       <div class="kpi">
-        <div><b>${rate===null?'-':rate+'%'}</b><small>profitable sells</small></div>
-        <div><b class="${net>=0?'up':'down'}">${fmt(net,2)}</b><small>net realised TAO</small></div>
-        <div><b>${wins}/${wins+losses}</b><small>wins / closed</small></div>
+        <div><b>${rate===null?'—':rate+'%'}</b><small>sales made at a profit</small></div>
+        <div><b class="${net>=0?'up':'down'}">${fmt(net,2)}</b><small>net TAO banked</small></div>
+        <div><b>${wins}/${wins+losses}</b><small>profitable / total sales</small></div>
       </div>
-      <p class="sub" style="margin-top:10px">Profit is worked out per subnet: what the
-      alpha sold for, against the average price paid for it.</p>
+      <p class="sub" style="margin-top:10px">Worked out from the ${w.tr.length}
+      buys and sells listed below - add up the profit column and you get the
+      ${fmt(net,2)} TAO figure. Nothing here is an estimate.</p>
     </div></div>
-    <h3>Every recent trade</h3>${tradeRows(w.tr)}
+    <h3>Every buy and sell, oldest to newest at the bottom</h3>${tradeRows(w.tr)}
     <p class="sub"><a href="https://taostats.io/account/${ck}" target="_blank"
       rel="noopener">Open this wallet on taostats ↗</a></p></div>`;
 }
