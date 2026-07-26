@@ -65,6 +65,29 @@ def backfill_events(conn, ck):
     return True
 
 
+def latest_per_day(items):
+    """Collapse balance records to ONE value per calendar day: the latest
+    reading of that day.
+
+    The endpoint returns a snapshot per block, so a single day can carry
+    several records of the same balance. Adding them up would multiply that
+    day's holdings, which then reads as a fake spike-and-crash in the return
+    maths. Records are not guaranteed to arrive newest-first, so compare
+    timestamps rather than trusting order.
+    """
+    best = {}
+    for item in items:
+        ts = str(item.get("timestamp", ""))
+        day = ts[:10]
+        if not day:
+            continue
+        tao = sweep.rao_to_tao(item.get("balance_as_tao"))
+        prev = best.get(day)
+        if prev is None or ts > prev[0]:
+            best[day] = (ts, tao)
+    return dict((day, tao) for day, (_ts, tao) in best.items())
+
+
 def backfill_history(conn, ck):
     """Daily per-subnet balances -> aggregate to wallet_daily (only for
     days older than existing snapshots, so live delta data wins).
@@ -81,6 +104,7 @@ def backfill_history(conn, ck):
     daily = {}
     sampled = False
     for hotkey, netuid in positions:
+        items = []
         page = 1
         while page <= MAX_HISTORY_PAGES:
             data = sweep.api_get(
@@ -90,21 +114,21 @@ def backfill_history(conn, ck):
                     ck, hotkey, netuid, PAGE_LIMIT, page))
             if data is None:
                 return False
-            items = data.get("data", [])
-            if not sampled and items:
-                print("  history sample keys: {}".format(sorted(items[0].keys())))
+            batch = data.get("data", [])
+            if not sampled and batch:
+                print("  history sample keys: {}".format(sorted(batch[0].keys())))
                 sampled = True
-            for item in items:
-                day = str(item.get("timestamp", ""))[:10]
-                if not day:
-                    continue
-                tao = sweep.rao_to_tao(item.get("balance_as_tao"))
-                daily.setdefault(day, {})
-                daily[day][netuid] = daily[day].get(netuid, 0.0) + tao
+            items.extend(batch)
             nxt = (data.get("pagination") or {}).get("next_page")
             if not nxt:
                 break
             page = nxt
+        # One snapshot per day for THIS position, then add positions together:
+        # two hotkeys on the same subnet should sum, two readings of the same
+        # hotkey on the same day should not.
+        for day, tao in latest_per_day(items).items():
+            daily.setdefault(day, {})
+            daily[day][netuid] = daily[day].get(netuid, 0.0) + tao
     first_live = conn.execute(
         "SELECT MIN(day) FROM wallet_daily WHERE coldkey=?", (ck,)).fetchone()[0]
     for day, per_subnet in daily.items():

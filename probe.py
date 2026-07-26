@@ -81,26 +81,34 @@ def main():
                       "response".format(field))
                 ok = False
 
-        # How many records land on the same calendar day? The backfill buckets
-        # by day, so more than one record per day means its running total is
-        # summing intraday snapshots of the SAME balance instead of picking one.
-        per_day = {}
+        # The endpoint returns a snapshot per block, so a day can carry several
+        # records. Run the real reducer the backfill uses and prove it collapses
+        # them instead of summing them into a fake spike.
+        raw = {}
         for item in hist["data"]:
             day = str(item.get("timestamp", ""))[:10]
-            per_day.setdefault(day, []).append(sweep.rao_to_tao(item.get("balance_as_tao")))
-        print("\n    records per calendar day (page 1):")
-        for day in sorted(per_day)[:6]:
-            vals = per_day[day]
-            print("      {}  {:3d} record(s)   summed={:.2f} TAO   latest={:.2f} TAO"
-                  .format(day, len(vals), sum(vals), vals[0]))
-        worst = max(len(v) for v in per_day.values())
-        if worst > 1:
-            print("\n    *** {} records share one day -> summing inflates that day "
-                  "by ~{}x. Must take one snapshot per day, not the sum. ***"
-                  .format(worst, worst))
+            raw.setdefault(day, []).append(sweep.rao_to_tao(item.get("balance_as_tao")))
+        reduced = backfill.latest_per_day(hist["data"])
+        busiest = max(len(v) for v in raw.values())
+        print("\n    {} record(s) over {} day(s); busiest day holds {} record(s)"
+              .format(len(hist["data"]), len(raw), busiest))
+        print("    day           n   naive-sum        backfill")
+        for day in sorted(raw)[-5:]:
+            print("      {}  {:3d}   {:10.2f}      {:10.2f} TAO".format(
+                day, len(raw[day]), sum(raw[day]), reduced[day]))
+
+        if len(reduced) != len(raw):
+            print("\n    FAIL reducer dropped days ({} -> {})".format(
+                len(raw), len(reduced)))
             ok = False
+        elif any(reduced[d] > max(raw[d]) + 1e-6 for d in raw):
+            print("\n    FAIL reducer still inflates at least one day")
+            ok = False
+        elif busiest > 1:
+            print("\n    OK  {} records shared a day and the reducer collapsed "
+                  "them to one snapshot (no inflation)".format(busiest))
         else:
-            print("\n    one record per day - safe to bucket by day.")
+            print("\n    OK  one record per day already; reducer is a no-op here")
 
     print("\nCalls used: {}".format(sweep.calls_used_this_run))
     print("RESULT: {}".format("PASS" if ok else "FAIL"))
