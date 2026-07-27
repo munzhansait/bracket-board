@@ -48,7 +48,7 @@ jobs:
             # No "|| true": if an asset exists but will not download, stop.
             # Carrying on would build an empty database and save that over it.
             gh release download "$DB_TAG" --repo "$GITHUB_REPOSITORY"               --pattern "$NAME" --clobber
-            mv -f "$NAME" bracketboard.db
+            [ "$NAME" = "bracketboard.db" ] || mv -f "$NAME" bracketboard.db
             echo "restored $NAME, $(stat -c%s bracketboard.db) bytes"
           else
             echo "No database asset yet - starting a new database."
