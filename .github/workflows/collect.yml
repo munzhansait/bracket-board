@@ -34,12 +34,19 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -e
-          if gh release view "$DB_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release download "$DB_TAG" --repo "$GITHUB_REPOSITORY" \
-              --pattern bracketboard.db --clobber
-            echo "restored $(stat -c%s bracketboard.db) bytes"
+          # Newest .db asset wins. Saves upload under a unique name, so during
+          # an upload the previous copy is still there and still newest until
+          # the new one lands.
+          NAME=$(gh release view "$DB_TAG" --repo "$GITHUB_REPOSITORY"             --json assets --jq '[.assets[]|select(.name|endswith(".db"))]
+                                |sort_by(.createdAt)|last|.name' 2>/dev/null || true)
+          if [ -n "$NAME" ] && [ "$NAME" != "null" ]; then
+            # No "|| true": if an asset exists but will not download, stop.
+            # Carrying on would build an empty database and save that over it.
+            gh release download "$DB_TAG" --repo "$GITHUB_REPOSITORY"               --pattern "$NAME" --clobber
+            mv -f "$NAME" bracketboard.db
+            echo "restored $NAME, $(stat -c%s bracketboard.db) bytes"
           else
-            echo "No database release yet - starting a new database."
+            echo "No database asset yet - starting a new database."
           fi
           echo "ready=1" >> "$GITHUB_OUTPUT"
 
@@ -66,5 +73,14 @@ jobs:
         run: |
           set -e
           [ -s bracketboard.db ] || { echo "database missing or empty; refusing to upload"; exit 1; }
-          gh release upload "$DB_TAG" bracketboard.db --repo "$GITHUB_REPOSITORY" --clobber
-          echo "saved $(stat -c%s bracketboard.db) bytes"
+          # Upload under a run-unique name and only then remove the previous
+          # copies. --clobber deletes before it uploads, so a run cancelled
+          # mid-upload destroys the only asset - which is exactly how the
+          # database was lost once.
+          NEW="bracketboard-${GITHUB_RUN_ID}.db"
+          cp bracketboard.db "$NEW"
+          gh release upload "$DB_TAG" "$NEW" --repo "$GITHUB_REPOSITORY"
+          for OLD in $(gh release view "$DB_TAG" --repo "$GITHUB_REPOSITORY"               --json assets --jq '.assets[].name' | grep -v "^${NEW}$"); do
+            gh release delete-asset "$DB_TAG" "$OLD" --repo "$GITHUB_REPOSITORY" -y || true
+          done
+          echo "saved $NEW, $(stat -c%s bracketboard.db) bytes"
