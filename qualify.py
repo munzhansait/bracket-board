@@ -258,10 +258,14 @@ def qualify(conn, verbose=True, full=None):
         "INSERT OR REPLACE INTO wallet_day_exception"
         "(coldkey,day,expected,actual,residual) VALUES(?,?,?,?,?)", exceptions)
 
-    top = conn.execute("SELECT MAX(rowid), MAX(day) FROM events, "
-                       "(SELECT MAX(day) day FROM wallet_daily)").fetchone()
-    sweep.meta_set(conn, "qualify_event_rowid", top[0] or 0)
-    sweep.meta_set(conn, "qualify_last_day", top[1] or "")
+    # Two statements, not a cross join. SQLite will not resolve a bare rowid
+    # once the FROM clause names more than one source, and the engine failed
+    # outright on "no such column: rowid" - which the sweep caught, so the
+    # board silently fell back to its own checks with no market corroboration.
+    row = conn.execute("SELECT MAX(rowid) FROM events").fetchone()
+    day = conn.execute("SELECT MAX(day) FROM wallet_daily").fetchone()
+    sweep.meta_set(conn, "qualify_event_rowid", (row and row[0]) or 0)
+    sweep.meta_set(conn, "qualify_last_day", (day and day[0]) or "")
     conn.commit()
 
     if verbose:
