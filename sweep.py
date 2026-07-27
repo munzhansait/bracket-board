@@ -227,7 +227,15 @@ def continue_sweep(conn):
                 done, current, page = set(), None, 1
                 meta_set(conn, "sweep_state", json.dumps({"done": [], "current": None, "page": 1}))
                 conn.commit()
-                continue
+                # One completed pass per run. Left to itself the loop starts
+                # the next pass immediately, and with a large manual budget it
+                # will crawl the whole network again minutes later to find
+                # that almost nothing moved - a 2500-call run spent ~836 of
+                # them re-crawling and wrote 3,614 changed rows out of 23,385.
+                # The next scheduled run picks the new pass up.
+                print("Pass complete - stopping so the remaining budget is not "
+                      "spent re-crawling what was just read.")
+                break
             current, page = remaining[0], 1
             print("Sweeping subnet {} (gen {})...".format(current, generation))
 
