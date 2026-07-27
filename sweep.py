@@ -37,6 +37,7 @@ DOCS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "docs")
 CALLS_PER_RUN = int(os.environ.get("CALLS_PER_RUN", "40"))
 MONTHLY_CEILING = int(os.environ.get("MONTHLY_CEILING", "9000"))
 PAUSE_SECONDS = float(os.environ.get("PACE_SECONDS", "13.2"))
+COMMIT_EVERY = int(os.environ.get("COMMIT_EVERY", "25"))  # see api_get
 PAGE_SIZE = 200
 DUST_TAO = 0.05          # ignore positions below this (TAO) to keep DB small
 RAO = 1_000_000_000      # 1 TAO = 1e9 rao
@@ -121,7 +122,16 @@ def api_get(conn, path, retries=2):
         time.sleep(PAUSE_SECONDS)
         calls_used_this_run += 1
         record_call(conn)
-        conn.commit()
+        # Committing on every single call costs nothing on a small database and
+        # a great deal on a large one: at 600 MB it added roughly half a second
+        # per call, so a 15,000-call backfill spent about 90 minutes of its
+        # timeout writing the counter rather than fetching anything. Commit
+        # periodically instead. A crash can lose at most COMMIT_EVERY calls off
+        # the counter, which under-reports usage by a rounding error - the
+        # per-wallet commits in the backfill still bound how much work is at
+        # risk.
+        if calls_used_this_run % COMMIT_EVERY == 0:
+            conn.commit()
         req = urllib.request.Request(url)
         req.add_header("accept", "application/json")
         req.add_header("Authorization", key)
